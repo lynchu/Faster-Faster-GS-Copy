@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "helper_math.h"
 #include <functional>
 
@@ -30,6 +32,7 @@ namespace faster_gs::rasterization {
         float* grad_conic_helper,
         float2* grad_mean2d_abs_helper,
         float* densification_info,
+        uint8_t* visibility,
         const int n_primitives,
         const int n_instances,
         const int n_buckets,

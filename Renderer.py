@@ -80,6 +80,7 @@ class FasterGSRenderer(BaseRenderer):
             sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
             densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
             rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
+            visibility=self.model.gaussians.visibility_buffer,
         )
         if self.model.ppisp is not None:
             image = self.model.ppisp(image, view)

@@ -31,6 +31,7 @@ namespace faster_gs::rasterization::kernels::backward {
         float3* __restrict__ grad_sh_coefficients_0,
         float3* __restrict__ grad_sh_coefficients_rest,
         float* __restrict__ densification_info,
+        uint8_t* __restrict__ visibility,
         const uint n_primitives,
         const uint active_sh_bases,
         const uint total_sh_bases,
@@ -53,9 +54,13 @@ namespace faster_gs::rasterization::kernels::backward {
         const bool valid = thread_idx < n_primitives;
         const uint primitive_idx = valid ? thread_idx : n_primitives - 1;
         const bool active = valid && primitive_n_touched_tiles[primitive_idx] > 0;
+        // Faster-GS+LazyAdam: per-Gaussian visibility for the optimizer (invisible Gaussians have exactly zero gradients)
+        if (valid && visibility != nullptr) visibility[primitive_idx] = active ? 1 : 0;
 
-        // gradients are not zero-initialized
-        if (valid && !active) {
+        // gradients are not zero-initialized; with Faster-GS+LazyAdam (visibility != nullptr) the optimizer never reads the
+        // gradients of invisible Gaussians, so their zero writes are skipped
+        if (visibility != nullptr && warp.ballot(active) == 0) return;
+        if (valid && !active && visibility == nullptr) {
             grad_means[primitive_idx] = make_float3(0.0f);
             grad_scales[primitive_idx] = make_float3(0.0f);
             grad_rotations[primitive_idx] = make_float4(0.0f);

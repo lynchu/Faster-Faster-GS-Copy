@@ -103,6 +103,10 @@ class FasterGSTrainer(GuiTrainer):
                 positions = carve(positions, dataset, self.RANDOM_INITIALIZATION.CARVING_IN_ALL_FRUSTUMS, self.RANDOM_INITIALIZATION.CARVING_ENFORCE_ALPHA)
             point_cloud = BasicPointCloud(positions)
         self.model.gaussians.initialize_from_point_cloud(point_cloud, self.USE_MCMC)
+        # Faster-GS+LazyAdam relies on invisible Gaussians receiving exactly zero updates besides Adam itself
+        if self.USE_MCMC or self.FILTER_3D.USE or self.model.ppisp is not None \
+                or self.LOSS.LAMBDA_OPACITY_REGULARIZATION > 0.0 or self.LOSS.LAMBDA_SCALE_REGULARIZATION > 0.0:
+            raise Framework.TrainingError('Faster-GS+LazyAdam does not support MCMC, the 3D filter, PPISP, or opacity/scale regularization')
         self.model.gaussians.training_setup(self, radius)
         if not self.USE_MCMC:
             self.model.gaussians.reset_densification_info(self.DENSIFICATION_USE_ABS_GRAD)
