@@ -15,19 +15,21 @@ namespace faster_gs::adam {
     __device__ __forceinline__ void catch_up(
         float& param, float& moment1, float& moment2,
         const int t0, const int k,
-        const double* __restrict__ f_table,
+        const float* __restrict__ f_table,
         const float* __restrict__ step_size_table,
         const float* __restrict__ bias_correction2_sqrt_rcp_table,
         const float beta1, const float beta2, const float epsilon,
-        const double log_gamma, const float log2_beta1, const float log2_beta2)
+        const float log2_gamma, const float log2_beta1, const float log2_beta2)
     {
         const int window = min(k, max_explicit_steps);
         // epsilon is negligible (< 1e-6 relative) if sqrt(v) stays above 1e6 * epsilon over the significant window
         const float sqrt_v_window_end = sqrtf(moment2 * exp2f(static_cast<float>(window) * log2_beta2));
         if (sqrt_v_window_end >= 1e6f * epsilon) {
-            // closed form: theta -= m / sqrt(v) * sum_j f(t0 + j) gamma^j
-            const double displacement_scale = f_table[t0] - exp(static_cast<double>(k) * log_gamma) * f_table[t0 + k];
-            param -= static_cast<float>(static_cast<double>(moment1) * rsqrt(static_cast<double>(moment2)) * displacement_scale);
+            // closed form: theta -= m / sqrt(v) * sum_j f(t0 + j) gamma^j (float32 suffices: the relative error of the
+            // displacement is ~1e-6, i.e., orders of magnitude below the float32 spacing of the parameter; FP64 would be
+            // 64x slower on this GPU class)
+            const float displacement_scale = f_table[t0] - exp2f(static_cast<float>(k) * log2_gamma) * f_table[t0 + k];
+            param -= moment1 * rsqrtf(moment2) * displacement_scale;
             moment1 *= exp2f(static_cast<float>(k) * log2_beta1);
             moment2 *= exp2f(static_cast<float>(k) * log2_beta2);
         } else {
@@ -53,7 +55,7 @@ namespace faster_gs::adam {
         float* __restrict__ exp_avg_sq,
         const uint8_t* __restrict__ visibility,
         const int* __restrict__ last_step,
-        const double* __restrict__ f_table,
+        const float* __restrict__ f_table,
         const float* __restrict__ step_size_table,
         const float* __restrict__ bias_correction2_sqrt_rcp_table,
         const int n_elements,
@@ -64,7 +66,7 @@ namespace faster_gs::adam {
         const float beta2,
         const float epsilon,
         const float bias_correction2_sqrt_rcp,
-        const double log_gamma,
+        const float log2_gamma,
         const float log2_beta1,
         const float log2_beta2)
     {
@@ -77,7 +79,7 @@ namespace faster_gs::adam {
         float m2 = exp_avg_sq[idx];
         const int t0 = last_step[gaussian_idx];
         const int k = step - 1 - t0;
-        if (k > 0) catch_up(p, m1, m2, t0, k, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log_gamma, log2_beta1, log2_beta2);
+        if (k > 0) catch_up(p, m1, m2, t0, k, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log2_gamma, log2_beta1, log2_beta2);
         // regular step, identical to adam_step_cu
         const float grad = param_grad[idx];
         const float grad_sq = grad * grad;
@@ -94,7 +96,7 @@ namespace faster_gs::adam {
         float* __restrict__ exp_avg,
         float* __restrict__ exp_avg_sq,
         const int* __restrict__ last_step,
-        const double* __restrict__ f_table,
+        const float* __restrict__ f_table,
         const float* __restrict__ step_size_table,
         const float* __restrict__ bias_correction2_sqrt_rcp_table,
         const int n_elements,
@@ -103,7 +105,7 @@ namespace faster_gs::adam {
         const float beta1,
         const float beta2,
         const float epsilon,
-        const double log_gamma,
+        const float log2_gamma,
         const float log2_beta1,
         const float log2_beta2)
     {
@@ -116,7 +118,7 @@ namespace faster_gs::adam {
         float p = param[idx];
         float m1 = exp_avg[idx];
         float m2 = exp_avg_sq[idx];
-        catch_up(p, m1, m2, t0, k, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log_gamma, log2_beta1, log2_beta2);
+        catch_up(p, m1, m2, t0, k, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log2_gamma, log2_beta1, log2_beta2);
         param[idx] = p;
         exp_avg[idx] = m1;
         exp_avg_sq[idx] = m2;
@@ -169,7 +171,7 @@ namespace faster_gs::adam {
             exp_avg_sq.data_ptr<float>(),
             visibility.data_ptr<uint8_t>(),
             last_step.data_ptr<int>(),
-            f_table.data_ptr<double>(),
+            f_table.data_ptr<float>(),
             step_size_table.data_ptr<float>(),
             bias_correction2_sqrt_rcp_table.data_ptr<float>(),
             n_elements,
@@ -180,7 +182,7 @@ namespace faster_gs::adam {
             static_cast<float>(beta2),
             static_cast<float>(epsilon),
             static_cast<float>(bias_correction2_sqrt_rcp),
-            std::log(beta1 / std::sqrt(beta2)),
+            static_cast<float>(std::log2(beta1 / std::sqrt(beta2))),
             static_cast<float>(std::log2(beta1)),
             static_cast<float>(std::log2(beta2))
         );
@@ -210,7 +212,7 @@ namespace faster_gs::adam {
             exp_avg.data_ptr<float>(),
             exp_avg_sq.data_ptr<float>(),
             last_step.data_ptr<int>(),
-            f_table.data_ptr<double>(),
+            f_table.data_ptr<float>(),
             step_size_table.data_ptr<float>(),
             bias_correction2_sqrt_rcp_table.data_ptr<float>(),
             n_elements,
@@ -219,7 +221,7 @@ namespace faster_gs::adam {
             static_cast<float>(beta1),
             static_cast<float>(beta2),
             static_cast<float>(epsilon),
-            std::log(beta1 / std::sqrt(beta2)),
+            static_cast<float>(std::log2(beta1 / std::sqrt(beta2))),
             static_cast<float>(std::log2(beta1)),
             static_cast<float>(std::log2(beta2))
         );

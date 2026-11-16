@@ -17,7 +17,7 @@ namespace faster_gs::adam {
         torch::Tensor& exp_avg_sq,
         const torch::Tensor& visibility,  // uint8 [n_gaussians]
         const torch::Tensor& last_step,   // int32 [n_gaussians]
-        const torch::Tensor& f_table,     // float64 [T + 2], the F[t] sums of this parameter group
+        const torch::Tensor& f_table,     // float32 [T + 2], the F[t] sums of this parameter group (computed in float64)
         const torch::Tensor& step_size_table,                  // float32 [T + 2], lr_s / (1 - beta1^s) as in adam_step
         const torch::Tensor& bias_correction2_sqrt_rcp_table,  // float32 [T + 2], 1 / sqrt(1 - beta2^s) as in adam_step
         const int step_count,

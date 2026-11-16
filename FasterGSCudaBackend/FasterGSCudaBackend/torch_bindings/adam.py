@@ -77,7 +77,7 @@ class LazyAdam(FusedAdam):
                 lr = schedule(s) if schedule is not None else group['lr']
                 step_size[s] = lr * (1.0 / (1.0 - math.pow(beta1, s)))
                 bc2[s] = 1.0 / math.sqrt(1.0 - math.pow(beta2, s))
-            self.f_tables[name] = (torch.tensor(F, dtype=torch.float64, device='cuda'),
+            self.f_tables[name] = (torch.tensor(F, dtype=torch.float64, device='cuda').to(torch.float32),
                                    torch.tensor(step_size, dtype=torch.float32, device='cuda'),
                                    torch.tensor(bc2, dtype=torch.float32, device='cuda'))
         return self.f_tables[name]
