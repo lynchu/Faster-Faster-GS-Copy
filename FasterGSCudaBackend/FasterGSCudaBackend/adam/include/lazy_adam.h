@@ -55,7 +55,9 @@ namespace faster_gs::adam {
         const float center_x,
         const float center_y,
         const float near_plane,
-        const float far_plane);
+        const float far_plane,
+        const float extent_scale,
+        const float extent_pad);
 
     // catch-up of steps last_step + 1 .. target_step for Gaussians with mask[i] != 0 (no regular step)
     void lazy_adam_flush_masked_wrapper(

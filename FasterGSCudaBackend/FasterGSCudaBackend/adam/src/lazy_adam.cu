@@ -157,7 +157,8 @@ namespace faster_gs::adam {
         const float width, const float height,
         const float focal_x, const float focal_y,
         const float center_x, const float center_y,
-        const float near_plane, const float far_plane)
+        const float near_plane, const float far_plane,
+        const float extent_scale, const float extent_pad)
     {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= n) return;
@@ -187,10 +188,10 @@ namespace faster_gs::adam {
         const float b1 = j22 * r2.x + j23 * r3.x, b2 = j22 * r2.y + j23 * r3.y, b3 = j22 * r2.z + j23 * r3.z;
         const float cov_xx = a1 * (a1 * c11 + a2 * c12 + a3 * c13) + a2 * (a1 * c12 + a2 * c22 + a3 * c23) + a3 * (a1 * c13 + a2 * c23 + a3 * c33) + 0.3f;
         const float cov_yy = b1 * (b1 * c11 + b2 * c12 + b3 * c13) + b2 * (b1 * c12 + b2 * c22 + b3 * c23) + b3 * (b1 * c13 + b2 * c23 + b3 * c33) + 0.3f;
-        // extent for opacity 1 (largest possible) at the 1/255 cutoff, inflated by 1.5x plus a 16 px margin
+        // extent for opacity 1 (largest possible) at the 1/255 cutoff, inflated by extent_scale plus extent_pad pixels
         constexpr float cutoff = 2.0f * 5.54126354516f;
-        const float ex = 1.5f * sqrtf(fmaxf(cov_xx, 0.0f) * cutoff) + 16.0f;
-        const float ey = 1.5f * sqrtf(fmaxf(cov_yy, 0.0f) * cutoff) + 16.0f;
+        const float ex = extent_scale * sqrtf(fmaxf(cov_xx, 0.0f) * cutoff) + extent_pad;
+        const float ey = extent_scale * sqrtf(fmaxf(cov_yy, 0.0f) * cutoff) + extent_pad;
         const float mx = x * focal_x + center_x, my = y * focal_y + center_y;
         const bool overlaps = (mx + ex >= 0.0f) && (mx - ex <= width) && (my + ey >= 0.0f) && (my - ey <= height);
         candidates[idx] = (overlaps || !isfinite(ex) || !isfinite(ey)) ? 1 : 0;
@@ -241,7 +242,8 @@ namespace faster_gs::adam {
     void lazy_candidates_wrapper(
         const torch::Tensor& means, const torch::Tensor& scales, const torch::Tensor& rotations, const torch::Tensor& w2c,
         torch::Tensor& candidates, const int width, const int height, const float focal_x, const float focal_y,
-        const float center_x, const float center_y, const float near_plane, const float far_plane)
+        const float center_x, const float center_y, const float near_plane, const float far_plane,
+        const float extent_scale, const float extent_pad)
     {
         const at::cuda::CUDAGuard device_guard(means.device());
         const int n = means.size(0);
@@ -251,7 +253,7 @@ namespace faster_gs::adam {
             reinterpret_cast<const float3*>(means.data_ptr<float>()), reinterpret_cast<const float3*>(scales.data_ptr<float>()),
             reinterpret_cast<const float4*>(rotations.data_ptr<float>()), reinterpret_cast<const float4*>(w2c_c.data_ptr<float>()),
             candidates.data_ptr<uint8_t>(), n, static_cast<float>(width), static_cast<float>(height),
-            focal_x, focal_y, center_x, center_y, near_plane, far_plane);
+            focal_x, focal_y, center_x, center_y, near_plane, far_plane, extent_scale, extent_pad);
         CHECK_CUDA(config::debug, "lazy_candidates")
     }
 

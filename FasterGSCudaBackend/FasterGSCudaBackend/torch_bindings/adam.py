@@ -53,6 +53,12 @@ class LazyAdam(FusedAdam):
         self.candidates = None
         self.check_staleness = False
         self.stale_visible_counts = []
+        self.candidate_fractions = []
+        # inflation of the candidate test. The pad must cover the tile-grid padding of preprocess (bounds are clamped to
+        # the grid padded to multiples of 16 x 12 px, so up to 15 px beyond the image still count as visible):
+        # 1.1x + 4 px missed ~1-2.5k visible Gaussians per step, 1.5x + 16 px missed none (garden, iter 2601 / 15100)
+        self.extent_scale = 1.5
+        self.extent_pad = 16.0
         self.num_steps = num_steps
         self.lr_schedules = lr_schedules or {}  # group name -> callable(step) -> lr (defaults to the constant group lr)
         self.step_count = 0
@@ -116,7 +122,9 @@ class LazyAdam(FusedAdam):
             self.candidates = torch.zeros(n, dtype=torch.uint8, device='cuda')
         _C.lazy_candidates(means, scales, rotations, settings.w2c, self.candidates, settings.width, settings.height,
                            settings.focal_x, settings.focal_y, settings.center_x, settings.center_y,
-                           settings.near_plane, settings.far_plane)
+                           settings.near_plane, settings.far_plane, self.extent_scale, self.extent_pad)
+        if self.check_staleness:
+            self.candidate_fractions.append(self.candidates.float().mean().item())
         for group in self.param_groups:
             param = group['params'][0]
             state = self.state.get(param)
