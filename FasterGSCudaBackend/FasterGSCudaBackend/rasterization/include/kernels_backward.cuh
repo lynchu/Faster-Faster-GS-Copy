@@ -57,8 +57,10 @@ namespace faster_gs::rasterization::kernels::backward {
         // Faster-GS+LazyAdam: per-Gaussian visibility for the optimizer (invisible Gaussians have exactly zero gradients)
         if (valid && visibility != nullptr) visibility[primitive_idx] = active ? 1 : 0;
 
-        // gradients are not zero-initialized
-        if (valid && !active) {
+        // gradients are not zero-initialized; with Faster-GS+LazyAdam (visibility != nullptr) the optimizer never reads the
+        // gradients of invisible Gaussians, so their zero writes are skipped
+        if (visibility != nullptr && warp.ballot(active) == 0) return;
+        if (valid && !active && visibility == nullptr) {
             grad_means[primitive_idx] = make_float3(0.0f);
             grad_scales[primitive_idx] = make_float3(0.0f);
             grad_rotations[primitive_idx] = make_float4(0.0f);
