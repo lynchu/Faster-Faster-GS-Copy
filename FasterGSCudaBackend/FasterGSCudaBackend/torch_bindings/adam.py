@@ -70,7 +70,16 @@ class LazyAdam(FusedAdam):
             F = [0.0] * (T + 2)
             for t in range(T - 1, -1, -1):
                 F[t] = gamma * (f[t + 1] + F[t + 1])
-            self.f_tables[name] = torch.tensor(F, dtype=torch.float64, device='cuda')
+            # per-step factors with exactly the double-precision formulas of adam_step_wrapper, then rounded to float32
+            step_size = [0.0] * (T + 2)
+            bc2 = [0.0] * (T + 2)
+            for s in range(1, T + 1):
+                lr = schedule(s) if schedule is not None else group['lr']
+                step_size[s] = lr * (1.0 / (1.0 - math.pow(beta1, s)))
+                bc2[s] = 1.0 / math.sqrt(1.0 - math.pow(beta2, s))
+            self.f_tables[name] = (torch.tensor(F, dtype=torch.float64, device='cuda'),
+                                   torch.tensor(step_size, dtype=torch.float32, device='cuda'),
+                                   torch.tensor(bc2, dtype=torch.float32, device='cuda'))
         return self.f_tables[name]
 
     def n_gaussians(self) -> int:
@@ -112,7 +121,7 @@ class LazyAdam(FusedAdam):
                 raise RuntimeError('LazyAdam: parameter groups are out of step')
             _C.lazy_adam_step(
                 param.grad, param, state['exp_avg'], state['exp_avg_sq'],
-                visibility, self.last_step, self._f_table(group),
+                visibility, self.last_step, *self._f_table(group),
                 state['step'], group['lr'], *group['betas'], group['eps'],
             )
         _C.lazy_adam_mark(visibility, self.last_step, self.step_count)
@@ -130,7 +139,7 @@ class LazyAdam(FusedAdam):
             state = self.state.get(param)
             if not state or param.numel() == 0:
                 continue
-            _C.lazy_adam_flush(param, state['exp_avg'], state['exp_avg_sq'], self.last_step, self._f_table(group),
-                               self.step_count, *group['betas'])
+            _C.lazy_adam_flush(param, state['exp_avg'], state['exp_avg_sq'], self.last_step, *self._f_table(group),
+                               self.step_count, *group['betas'], group['eps'])
         self.last_step.fill_(self.step_count)
         self.flushed_step = self.step_count

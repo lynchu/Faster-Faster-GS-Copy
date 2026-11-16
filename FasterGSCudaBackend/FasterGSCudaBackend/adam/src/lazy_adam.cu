@@ -8,19 +8,42 @@
 
 namespace faster_gs::adam {
 
-    // closed-form application of k >= 1 zero-gradient Adam steps following step t0
+    // zero-gradient steps beyond this window change the parameter by less than beta1^256 ~ 2e-12 of the momentum displacement
+    constexpr int max_explicit_steps = 256;
+
+    // application of k >= 1 zero-gradient Adam steps following step t0
     __device__ __forceinline__ void catch_up(
         float& param, float& moment1, float& moment2,
         const int t0, const int k,
         const double* __restrict__ f_table,
+        const float* __restrict__ step_size_table,
+        const float* __restrict__ bias_correction2_sqrt_rcp_table,
+        const float beta1, const float beta2, const float epsilon,
         const double log_gamma, const float log2_beta1, const float log2_beta2)
     {
-        if (moment2 > 0.0f) {
+        const int window = min(k, max_explicit_steps);
+        // epsilon is negligible (< 1e-6 relative) if sqrt(v) stays above 1e6 * epsilon over the significant window
+        const float sqrt_v_window_end = sqrtf(moment2 * exp2f(static_cast<float>(window) * log2_beta2));
+        if (sqrt_v_window_end >= 1e6f * epsilon) {
+            // closed form: theta -= m / sqrt(v) * sum_j f(t0 + j) gamma^j
             const double displacement_scale = f_table[t0] - exp(static_cast<double>(k) * log_gamma) * f_table[t0 + k];
             param -= static_cast<float>(static_cast<double>(moment1) * rsqrt(static_cast<double>(moment2)) * displacement_scale);
+            moment1 *= exp2f(static_cast<float>(k) * log2_beta1);
+            moment2 *= exp2f(static_cast<float>(k) * log2_beta2);
+        } else {
+            // tiny second moment: replay the zero-gradient steps with exactly the arithmetic of adam_step_cu
+            for (int j = 1; j <= window; ++j) {
+                const int s = t0 + j;
+                moment1 = fmaf(beta1, moment1, 0.0f);
+                moment2 = fmaf(beta2, moment2, 0.0f);
+                const float denom = sqrtf(moment2) * bias_correction2_sqrt_rcp_table[s] + epsilon;
+                param -= step_size_table[s] * moment1 / denom;
+            }
+            if (k > window) {
+                moment1 *= exp2f(static_cast<float>(k - window) * log2_beta1);
+                moment2 *= exp2f(static_cast<float>(k - window) * log2_beta2);
+            }
         }
-        moment1 *= exp2f(static_cast<float>(k) * log2_beta1);
-        moment2 *= exp2f(static_cast<float>(k) * log2_beta2);
     }
 
     __global__ void lazy_adam_step_cu(
@@ -31,6 +54,8 @@ namespace faster_gs::adam {
         const uint8_t* __restrict__ visibility,
         const int* __restrict__ last_step,
         const double* __restrict__ f_table,
+        const float* __restrict__ step_size_table,
+        const float* __restrict__ bias_correction2_sqrt_rcp_table,
         const int n_elements,
         const int n_elements_per_gaussian,
         const int step,
@@ -52,7 +77,7 @@ namespace faster_gs::adam {
         float m2 = exp_avg_sq[idx];
         const int t0 = last_step[gaussian_idx];
         const int k = step - 1 - t0;
-        if (k > 0) catch_up(p, m1, m2, t0, k, f_table, log_gamma, log2_beta1, log2_beta2);
+        if (k > 0) catch_up(p, m1, m2, t0, k, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log_gamma, log2_beta1, log2_beta2);
         // regular step, identical to adam_step_cu
         const float grad = param_grad[idx];
         const float grad_sq = grad * grad;
@@ -70,9 +95,14 @@ namespace faster_gs::adam {
         float* __restrict__ exp_avg_sq,
         const int* __restrict__ last_step,
         const double* __restrict__ f_table,
+        const float* __restrict__ step_size_table,
+        const float* __restrict__ bias_correction2_sqrt_rcp_table,
         const int n_elements,
         const int n_elements_per_gaussian,
         const int target_step,
+        const float beta1,
+        const float beta2,
+        const float epsilon,
         const double log_gamma,
         const float log2_beta1,
         const float log2_beta2)
@@ -86,7 +116,7 @@ namespace faster_gs::adam {
         float p = param[idx];
         float m1 = exp_avg[idx];
         float m2 = exp_avg_sq[idx];
-        catch_up(p, m1, m2, t0, k, f_table, log_gamma, log2_beta1, log2_beta2);
+        catch_up(p, m1, m2, t0, k, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log_gamma, log2_beta1, log2_beta2);
         param[idx] = p;
         exp_avg[idx] = m1;
         exp_avg_sq[idx] = m2;
@@ -111,6 +141,8 @@ namespace faster_gs::adam {
         const torch::Tensor& visibility,
         const torch::Tensor& last_step,
         const torch::Tensor& f_table,
+        const torch::Tensor& step_size_table,
+        const torch::Tensor& bias_correction2_sqrt_rcp_table,
         const int step_count,
         const double learning_rate,
         const double beta1,
@@ -138,6 +170,8 @@ namespace faster_gs::adam {
             visibility.data_ptr<uint8_t>(),
             last_step.data_ptr<int>(),
             f_table.data_ptr<double>(),
+            step_size_table.data_ptr<float>(),
+            bias_correction2_sqrt_rcp_table.data_ptr<float>(),
             n_elements,
             n_elements / n_gaussians,
             step_count,
@@ -159,9 +193,12 @@ namespace faster_gs::adam {
         torch::Tensor& exp_avg_sq,
         const torch::Tensor& last_step,
         const torch::Tensor& f_table,
+        const torch::Tensor& step_size_table,
+        const torch::Tensor& bias_correction2_sqrt_rcp_table,
         const int target_step,
         const double beta1,
-        const double beta2)
+        const double beta2,
+        const double epsilon)
     {
         const at::cuda::CUDAGuard device_guard(param.device());
         const int n_elements = param.numel();
@@ -174,9 +211,14 @@ namespace faster_gs::adam {
             exp_avg_sq.data_ptr<float>(),
             last_step.data_ptr<int>(),
             f_table.data_ptr<double>(),
+            step_size_table.data_ptr<float>(),
+            bias_correction2_sqrt_rcp_table.data_ptr<float>(),
             n_elements,
             n_elements / n_gaussians,
             target_step,
+            static_cast<float>(beta1),
+            static_cast<float>(beta2),
+            static_cast<float>(epsilon),
             std::log(beta1 / std::sqrt(beta2)),
             static_cast<float>(std::log2(beta1)),
             static_cast<float>(std::log2(beta2))
