@@ -69,6 +69,40 @@ class FasterGSRenderer(BaseRenderer):
         else:
             return self.render_image_inference(view, to_chw)
 
+    def cached_training_settings(self, view: View, bg_color: torch.Tensor) -> RasterizerSettings:
+        """Faster-GS+SyncFree: uploads each training view's w2c / position once instead of every iteration.
+
+        view.w2c and view.position build new CUDA tensors from numpy on every access, i.e., two synchronous
+        host-to-device copies per iteration. The cached tensors hold exactly the same float32 values.
+        """
+        if not hasattr(self, '_view_tensor_cache'):
+            self._view_tensor_cache = {}
+        key = (id(view), view.c2w_numpy.tobytes())
+        cached = self._view_tensor_cache.get(key)
+        if cached is None:
+            cached = (view.w2c, view.position)
+            self._view_tensor_cache[key] = cached
+        if not isinstance(view.camera, PerspectiveCamera):
+            raise Framework.RendererError('FasterGS renderer only supports perspective cameras')
+        if view.camera.distortion is not None:
+            Logger.log_warning('found distortion parameters that will be ignored by the rasterizer')
+        # same fields as extract_settings(), but without touching view.w2c / view.position
+        return RasterizerSettings(
+            cached[0],
+            cached[1],
+            bg_color,
+            self.model.gaussians.active_sh_bases,
+            view.camera.width,
+            view.camera.height,
+            view.camera.focal_x,
+            view.camera.focal_y,
+            view.camera.center_x,
+            view.camera.center_y,
+            view.camera.near_plane,
+            view.camera.far_plane,
+            self.PROPER_ANTIALIASING,
+        )
+
     def render_image_training(self, view: View, update_densification_info: bool, bg_color: torch.Tensor) -> torch.Tensor:
         """Renders an image for a given view."""
         image = diff_rasterize(
@@ -79,7 +113,7 @@ class FasterGSRenderer(BaseRenderer):
             sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
             sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
             densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
-            rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
+            rasterizer_settings=self.cached_training_settings(view, bg_color),
             visibility=self.model.gaussians.visibility_buffer,
         )
         if self.model.ppisp is not None:
