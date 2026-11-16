@@ -270,10 +270,15 @@ class Gaussians(torch.nn.Module):
 
     def update_learning_rate(self, iteration: int) -> None:
         """Computes the current learning rate for the given iteration."""
-        self.lr_means = self.lr_means_scheduler(iteration)
-        for param_group in self.optimizer.param_groups:
-            if param_group['name'] == 'means':
-                param_group['lr'] = self.lr_means
+        # Faster-GS+LeanLoop: LRDecayPolicy evaluates numpy expressions on every call; the values for all iterations are
+        # precomputed once with the same policy (identical floats) and the means parameter group is looked up only once
+        table = getattr(self, '_lr_means_table', None)
+        if table is None or getattr(self, '_lr_means_table_policy', None) is not self.lr_means_scheduler:
+            self._lr_means_table = table = [self.lr_means_scheduler(i) for i in range(self.lr_means_scheduler.max_steps + 2)]
+            self._lr_means_table_policy = self.lr_means_scheduler
+            self._means_param_group = next(g for g in self.optimizer.param_groups if g['name'] == 'means')
+        self.lr_means = table[iteration] if 0 <= iteration < len(table) else self.lr_means_scheduler(iteration)
+        self._means_param_group['lr'] = self.lr_means
 
     def reset_opacities(self) -> None:
         """Resets the opacities to a fixed value."""

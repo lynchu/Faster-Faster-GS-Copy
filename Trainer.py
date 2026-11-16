@@ -175,10 +175,12 @@ class FasterGSTrainer(GuiTrainer):
     @training_callback(priority=80)
     def training_iteration(self, iteration: int, dataset: 'BaseDataset') -> None:
         """Performs a training step."""
-        # init modes
-        self.model.train()
+        # init modes (Faster-GS+LeanLoop: Module.train() recurses through all submodules, skip it if nothing changed)
+        if not self.model.training:
+            self.model.train()
         dataset.train()
-        self.loss.train()
+        if not self.loss.training:
+            self.loss.train()
         # update learning rate
         self.model.gaussians.update_learning_rate(iteration + 1)
         # get random view
@@ -198,9 +200,15 @@ class FasterGSTrainer(GuiTrainer):
         loss = self.loss(image, rgb_gt)
         # backward
         loss.backward()
-        # optimizer step
-        self.model.gaussians.optimizer.step()
-        self.model.gaussians.optimizer.zero_grad()
+        # optimizer step (Faster-GS+LeanLoop: call the optimizer's own step directly instead of the torch.optim wrapper,
+        # which adds a profiler record_function and hook bookkeeping on every call; no hooks are registered, so the
+        # behavior is identical. Setting the gradients to None is exactly zero_grad(set_to_none=True).)
+        optimizer = self.model.gaussians.optimizer
+        step_fn = getattr(type(optimizer).step, '__wrapped__', type(optimizer).step)
+        step_fn(optimizer)
+        for param_group in optimizer.param_groups:
+            for param in param_group['params']:
+                param.grad = None
         self.model.gaussians.post_optimizer_step(inject_noise=self.USE_MCMC)
         if self.model.ppisp is not None:
             self.model.ppisp.step()
