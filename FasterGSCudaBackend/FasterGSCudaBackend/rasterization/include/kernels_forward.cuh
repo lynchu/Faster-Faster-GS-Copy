@@ -430,6 +430,10 @@ namespace faster_gs::rasterization::kernels::forward {
                 const float3 color = fmaxf(primitive_color[primitive_idx], 0.0f);
                 collected_color[thread_rank] = color;
             }
+            // Faster-GS+BlendOccupancy: re-converge the warp before the block barrier; otherwise the compiler emits a
+            // divergence fallback with a register-indexed BAR.SYNC, which reserves all hardware barriers per block and
+            // limits blend_cu to a single resident block per SM
+            __syncwarp();
             block.sync();
             const int current_batch_size = min(config::block_size_blend, n_primitives_remaining);
             const uint n_processed_batch_start = n_primitives_total - n_primitives_remaining;
