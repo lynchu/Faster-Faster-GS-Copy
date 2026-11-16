@@ -23,6 +23,17 @@ class FasterGSLoss(BaseLoss):
         self.add_quality_metric('PSNR', torchmetrics.functional.image.peak_signal_noise_ratio)
 
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if not self.activate_logging:
+            # Faster-GS+SyncFree: evaluate only the active loss terms. The generic path creates torch.tensor(0.0) for every
+            # zero-weight term, which (with CUDA as default tensor type) is a synchronous host-to-device copy that blocks the
+            # CPU until the rasterizer has finished. The result is bitwise identical: adding exact zeros does not change it.
+            kwargs = {'L1_Color': {'input': input, 'target': target}, 'DSSIM_Color': {'input': input, 'target': target}}
+            loss = None
+            for item in self.loss_metrics:
+                if item.weight > 0.0:
+                    term = item.metric_func(**kwargs.get(item.name, {})) * item.weight
+                    loss = term if loss is None else loss + term
+            return loss
         return super().forward({
             'L1_Color': {'input': input, 'target': target},
             'DSSIM_Color': {'input': input, 'target': target},
