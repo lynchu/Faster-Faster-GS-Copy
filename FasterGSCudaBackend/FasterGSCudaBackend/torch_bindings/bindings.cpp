@@ -3,6 +3,7 @@
 #include "adam.h"
 #include "filter3d.h"
 #include "densification_api.h"
+#include "fused_loss.h"
 
 namespace rasterization_api = faster_gs::rasterization;
 namespace adam_api = faster_gs::adam;
@@ -18,4 +19,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("update_3d_filter", &filter3d_api::update_3d_filter_wrapper);
     m.def("relocation_adjustment", &densification_api::relocation_wrapper);
     m.def("add_noise", &densification_api::add_noise_wrapper);
+    m.def("l1_dssim_forward", &faster_gs::loss::l1_dssim_forward_wrapper);
+    m.def("l1_grad_combine", &faster_gs::loss::l1_grad_combine_wrapper);
 }

@@ -7,6 +7,7 @@ from Framework import ConfigParameterList
 from Optim.Losses.Base import BaseLoss
 from Optim.Losses.DSSIM import fused_dssim
 from Methods.FasterGS.Model import FasterGSModel
+from Methods.FasterGS.FasterGSCudaBackend import fused_l1_dssim
 
 
 class FasterGSLoss(BaseLoss):
@@ -23,6 +24,10 @@ class FasterGSLoss(BaseLoss):
         self.add_quality_metric('PSNR', torchmetrics.functional.image.peak_signal_noise_ratio)
 
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        weights = {item.name: item.weight for item in self.loss_metrics}
+        if not self.activate_logging and all(w == 0.0 for name, w in weights.items() if name not in ('L1_Color', 'DSSIM_Color')):
+            # Faster-GS+FusedLoss: L1 + DSSIM as one autograd node with 6 kernels instead of ~24
+            return fused_l1_dssim(input, target, weights['L1_Color'], weights['DSSIM_Color'])
         return super().forward({
             'L1_Color': {'input': input, 'target': target},
             'DSSIM_Color': {'input': input, 'target': target},
