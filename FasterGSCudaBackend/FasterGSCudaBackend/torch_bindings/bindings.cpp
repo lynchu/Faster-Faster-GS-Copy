@@ -19,6 +19,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lazy_adam_step", &adam_api::lazy_adam_step_wrapper);
     m.def("lazy_adam_flush", &adam_api::lazy_adam_flush_wrapper);
     m.def("lazy_adam_mark", &adam_api::lazy_adam_mark_wrapper);
+    m.def("lazy_candidates", &adam_api::lazy_candidates_wrapper);
+    m.def("lazy_adam_flush_masked", &adam_api::lazy_adam_flush_masked_wrapper);
+    m.def("lazy_mark_masked", &adam_api::lazy_mark_masked_wrapper);
+    m.def("lazy_count_stale_visible", &adam_api::lazy_count_stale_visible_wrapper);
     m.def("update_3d_filter", &filter3d_api::update_3d_filter_wrapper);
     m.def("relocation_adjustment", &densification_api::relocation_wrapper);
     m.def("add_noise", &densification_api::add_noise_wrapper);

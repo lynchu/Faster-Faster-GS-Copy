@@ -71,6 +71,12 @@ class FasterGSRenderer(BaseRenderer):
 
     def render_image_training(self, view: View, update_densification_info: bool, bg_color: torch.Tensor) -> torch.Tensor:
         """Renders an image for a given view."""
+        settings = extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING)
+        optimizer = self.model.gaussians.optimizer
+        if getattr(optimizer, 'exact', False):
+            # Faster-GS+LazyAdam-Exact: parameters of possibly visible Gaussians must be up to date before rendering
+            gs = self.model.gaussians
+            optimizer.prepare_forward(gs._means, gs._scales, gs._rotations, settings)
         image = diff_rasterize(
             means=self.model.gaussians.means,
             scales=self.model.gaussians.raw_scales,
@@ -79,7 +85,7 @@ class FasterGSRenderer(BaseRenderer):
             sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
             sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
             densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
-            rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
+            rasterizer_settings=settings,
             visibility=self.model.gaussians.visibility_buffer,
         )
         if self.model.ppisp is not None:

@@ -46,8 +46,13 @@ class LazyAdam(FusedAdam):
     state of all Gaussians (densification, opacity reset, sorting, end of training).
     """
 
-    def __init__(self, params, lr, eps, num_steps: int, lr_schedules: dict | None = None) -> None:
+    def __init__(self, params, lr, eps, num_steps: int, lr_schedules: dict | None = None, exact: bool = False) -> None:
         super().__init__(params=params, lr=lr, eps=eps)
+        # Faster-GS+LazyAdam-Exact: bring every Gaussian that may be visible up to date before the forward pass
+        self.exact = exact
+        self.candidates = None
+        self.check_staleness = False
+        self.stale_visible_counts = []
         self.num_steps = num_steps
         self.lr_schedules = lr_schedules or {}  # group name -> callable(step) -> lr (defaults to the constant group lr)
         self.step_count = 0
@@ -100,8 +105,33 @@ class LazyAdam(FusedAdam):
             self.last_step = torch.full((n,), self.step_count, dtype=torch.int32, device='cuda')
 
     @torch.no_grad()
+    def prepare_forward(self, means: torch.Tensor, scales: torch.Tensor, rotations: torch.Tensor, settings) -> None:
+        """Catches up all candidate-visible Gaussians to the last completed step, so that the forward pass of the next
+        step sees exactly the parameters dense Adam would have (Faster-GS+LazyAdam-Exact)."""
+        if not self.exact or self.step_count == 0:
+            return
+        self._ensure_last_step()
+        n = self.n_gaussians()
+        if self.candidates is None or self.candidates.shape[0] != n:
+            self.candidates = torch.zeros(n, dtype=torch.uint8, device='cuda')
+        _C.lazy_candidates(means, scales, rotations, settings.w2c, self.candidates, settings.width, settings.height,
+                           settings.focal_x, settings.focal_y, settings.center_x, settings.center_y,
+                           settings.near_plane, settings.far_plane)
+        for group in self.param_groups:
+            param = group['params'][0]
+            state = self.state.get(param)
+            if not state or param.numel() == 0:
+                continue
+            _C.lazy_adam_flush_masked(param, state['exp_avg'], state['exp_avg_sq'], self.candidates, self.last_step,
+                                      *self._f_table(group), self.step_count, *group['betas'], group['eps'])
+        _C.lazy_mark_masked(self.candidates, self.last_step, self.step_count)
+
+    @torch.no_grad()
     def step(self) -> None:
         self._ensure_last_step()
+        if self.exact and self.check_staleness and self.step_count > 0:
+            # visible Gaussians that the candidate test missed (would have been rendered with lagging parameters)
+            self.stale_visible_counts.append(_C.lazy_count_stale_visible(self.visibility_buffer(), self.last_step, self.step_count))
         self.step_count += 1
         visibility = self.visibility_buffer()
         for group in self.param_groups:

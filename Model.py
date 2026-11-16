@@ -254,7 +254,7 @@ class Gaussians(torch.nn.Module):
         # Faster-GS+LazyAdam: exact lazy Adam that only updates Gaussians visible in the current view;
         # the means learning rate at Adam step s is lr_means_scheduler(s) (see Trainer.update_learning_rate(iteration + 1))
         self.optimizer = LazyAdam(param_groups, lr=0.0, eps=1e-15, num_steps=training_wrapper.NUM_ITERATIONS,
-                                  lr_schedules={'means': self.lr_means_scheduler})
+                                  lr_schedules={'means': self.lr_means_scheduler}, exact=True)
 
     def flush_optimizer(self) -> None:
         """Brings every Gaussian up to date with the current optimizer step (Faster-GS+LazyAdam)."""
