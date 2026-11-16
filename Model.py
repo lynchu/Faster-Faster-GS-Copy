@@ -14,7 +14,7 @@ from Logging import Logger
 from Methods.Base.Model import BaseModel
 from Cameras.utils import quaternion_to_rotation_matrix
 from Methods.FasterGS.utils import rgb_to_sh0
-from Methods.FasterGS.FasterGSCudaBackend import FusedAdam, update_3d_filter, relocation_adjustment, add_noise
+from Methods.FasterGS.FasterGSCudaBackend import FusedAdam, LazyAdam, update_3d_filter, relocation_adjustment, add_noise
 from Optim.adam_utils import replace_param_group_data, prune_param_groups, extend_param_groups, sort_param_groups, reset_state
 from Optim.lr_utils import LRDecayPolicy
 from Optim.knn_utils import compute_root_mean_squared_knn_distances
@@ -245,13 +245,28 @@ class Gaussians(torch.nn.Module):
             {'params': [self._rotations], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_ROTATIONS, 'name': 'rotations'}
         ]
 
-        self.optimizer = FusedAdam(param_groups, lr=0.0, eps=1e-15)
-
         self.lr_means_scheduler = LRDecayPolicy(
             lr_init=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_INIT * self.training_cameras_extent,
             lr_final=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_FINAL * self.training_cameras_extent,
             max_steps=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_MAX_STEPS
         )
+
+        # Faster-GS+LazyAdam: exact lazy Adam that only updates Gaussians visible in the current view;
+        # the means learning rate at Adam step s is lr_means_scheduler(s) (see Trainer.update_learning_rate(iteration + 1))
+        self.optimizer = LazyAdam(param_groups, lr=0.0, eps=1e-15, num_steps=training_wrapper.NUM_ITERATIONS,
+                                  lr_schedules={'means': self.lr_means_scheduler})
+
+    def flush_optimizer(self) -> None:
+        """Brings every Gaussian up to date with the current optimizer step (Faster-GS+LazyAdam)."""
+        if isinstance(self.optimizer, LazyAdam):
+            self.optimizer.flush()
+
+    @property
+    def visibility_buffer(self) -> torch.Tensor | None:
+        """Per-Gaussian visibility filled by the rasterizer backward pass (Faster-GS+LazyAdam)."""
+        if isinstance(self.optimizer, LazyAdam):
+            return self.optimizer.visibility_buffer()
+        return None
 
     def update_learning_rate(self, iteration: int) -> None:
         """Computes the current learning rate for the given iteration."""
@@ -262,6 +277,7 @@ class Gaussians(torch.nn.Module):
 
     def reset_opacities(self) -> None:
         """Resets the opacities to a fixed value."""
+        self.flush_optimizer()
         opacities_new = self._opacities.clamp_max(-4.595119953155518)  # sigmoid(-4.595119953155518) = 0.01
         if self.use_original_3d_filter:
             # make sure that the current 3d filter has the same effect on the new opacities
@@ -275,6 +291,7 @@ class Gaussians(torch.nn.Module):
 
     def prune(self, prune_mask: torch.Tensor) -> None:
         """Prunes Gaussians that are not visible or too large."""
+        self.flush_optimizer()
         valid_mask = ~prune_mask
         param_groups = prune_param_groups(self.optimizer, valid_mask)
 
@@ -292,6 +309,7 @@ class Gaussians(torch.nn.Module):
 
     def sort(self, ordering: torch.Tensor) -> None:
         """Applies the given ordering to the Gaussians."""
+        self.flush_optimizer()
         param_groups = sort_param_groups(self.optimizer, ordering)
 
         self._means = param_groups['means']
@@ -313,6 +331,7 @@ class Gaussians(torch.nn.Module):
 
     def adaptive_density_control(self, grad_threshold: float, min_opacity: float, prune_large_gaussians: bool) -> None:
         """Densify Gaussians and prune those that are not visible or too large."""
+        self.flush_optimizer()
         denominator = self.densification_info[0].clamp_min(1.0)
         densification_mask = self.densification_info[1] >= grad_threshold * denominator
         if self.densification_info.shape[0] == 3:
@@ -480,12 +499,14 @@ class Gaussians(torch.nn.Module):
 
     def apply_morton_ordering(self) -> None:
         """Applies Morton ordering to the Gaussians."""
+        self.flush_optimizer()
         morton_encoding = morton_encode(self._means.data)
         order = torch.argsort(morton_encoding)
         self.sort(order)
 
     def importance_pruning(self, scores: torch.Tensor, pruning_ratio: float) -> None:
         """Prunes the given percentage of Gaussians with the lowest importance score (from Speedy-Splat)."""
+        self.flush_optimizer()
         k = int(pruning_ratio * (scores.numel() - 1)) + 1  # kthvalue is 1-based
         threshold = torch.kthvalue(scores, k).values
         prune_mask = scores <= threshold
@@ -502,6 +523,7 @@ class Gaussians(torch.nn.Module):
     @torch.no_grad()
     def training_cleanup(self, min_opacity: float) -> int:
         """Cleans the model after training."""
+        self.flush_optimizer()
         # bake 3d filter if used
         if self.use_optimized_3d_filter:
             # nothing to do, already baked in

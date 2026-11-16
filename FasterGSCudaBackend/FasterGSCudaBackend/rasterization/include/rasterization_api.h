@@ -30,6 +30,7 @@ namespace faster_gs::rasterization {
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
     backward_wrapper(
         torch::Tensor& densification_info,
+        torch::Tensor& visibility,
         const torch::Tensor& grad_image,
         const torch::Tensor& image,
         const torch::Tensor& means,

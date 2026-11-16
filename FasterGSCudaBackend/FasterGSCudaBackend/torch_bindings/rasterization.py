@@ -50,6 +50,7 @@ class _Rasterize(torch.autograd.Function):
         sh_coefficients_rest: torch.Tensor,
         densification_info: torch.Tensor,
         rasterizer_settings: RasterizerSettings,
+        visibility: torch.Tensor,
     ) -> torch.Tensor:
         (
             image,
@@ -80,6 +81,7 @@ class _Rasterize(torch.autograd.Function):
         )
         ctx.densification_info = densification_info
         ctx.mark_non_differentiable(densification_info)
+        ctx.visibility = visibility
         return image
 
     @staticmethod
@@ -87,12 +89,13 @@ class _Rasterize(torch.autograd.Function):
     def backward(
         ctx: Any,
         grad_image: torch.Tensor,
-    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None]':
+    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None]':
         (
             grad_means, grad_scales, grad_rotations, grad_opacities,
             grad_sh_coefficients_0, grad_sh_coefficients_rest
         ) = _C.backward(
             ctx.densification_info,
+            ctx.visibility,
             grad_image,
             *ctx.saved_tensors,
             *ctx.rasterizer_settings.as_tuple(),
@@ -107,6 +110,7 @@ class _Rasterize(torch.autograd.Function):
             grad_sh_coefficients_rest,
             None,  # densification_info
             None,  # rasterizer_settings
+            None,  # visibility
         )
 
 
@@ -119,6 +123,7 @@ def diff_rasterize(
     sh_coefficients_rest: torch.Tensor,
     densification_info: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
+    visibility: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _Rasterize.apply(
         means,
@@ -129,6 +134,7 @@ def diff_rasterize(
         sh_coefficients_rest,
         densification_info,
         rasterizer_settings,
+        visibility if visibility is not None else torch.empty(0, dtype=torch.uint8),
     )
 
 

@@ -98,6 +98,7 @@ faster_gs::rasterization::forward_wrapper(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 faster_gs::rasterization::backward_wrapper(
     torch::Tensor& densification_info,
+    torch::Tensor& visibility,
     const torch::Tensor& grad_image,
     const torch::Tensor& image,
     const torch::Tensor& means,
@@ -170,6 +171,7 @@ faster_gs::rasterization::backward_wrapper(
         grad_conic_helper.data_ptr<float>(),
         compute_abs_grad ? reinterpret_cast<float2*>(grad_mean2d_abs_helper.data_ptr<float>()) : nullptr,
         update_densification_info ? densification_info.data_ptr<float>() : nullptr,
+        visibility.size(0) == n_primitives ? visibility.data_ptr<uint8_t>() : nullptr,
         n_primitives,
         n_instances,
         n_buckets,
