@@ -299,7 +299,9 @@ namespace faster_gs::rasterization::kernels::backward {
 
     // based on https://github.com/humansensinglab/taming-3dgs/blob/fd0f7d9edfe135eb4eefd3be82ee56dada7f2a16/submodules/diff-gaussian-rasterization/cuda_rasterizer/backward.cu#L404
     template <bool compute_abs_grad>
-    __global__ void blend_backward_cu(
+    // Faster-GS+LeanShuffle: at most 64 registers so that 16 blocks of 2 warps (32 warps, the register limit) fit per SM;
+    // without the bound the two-warp version uses 71-72 registers (28 warps)
+    __global__ void __launch_bounds__(32 * config::blend_backward_warps_per_block, 16) blend_backward_cu(
         const uint2* __restrict__ tile_instance_ranges,
         const uint* __restrict__ tile_bucket_offsets,
         const uint* __restrict__ instance_primitive_indices,
