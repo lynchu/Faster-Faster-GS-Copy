@@ -56,7 +56,7 @@ void faster_gs::rasterization::backward(
     // note that with c++20 one could use a templated lambda to improve readability here
     auto dispatch_rasterize_backward = [&](const uint* instance_primitive_indices) {
         const auto blend_backward_kernel = grad_mean2d_abs_helper != nullptr ? kernels::backward::blend_backward_cu<true> : kernels::backward::blend_backward_cu<false>;
-        blend_backward_kernel<<<n_buckets, 32, 0, stream>>>(
+        blend_backward_kernel<<<div_round_up(n_buckets, config::blend_backward_warps_per_block), 32 * config::blend_backward_warps_per_block, 0, stream>>>(
             tile_buffers.instance_ranges,
             tile_buffers.buckets_offset,
             instance_primitive_indices,

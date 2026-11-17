@@ -328,7 +328,8 @@ namespace faster_gs::rasterization::kernels::backward {
     {
         auto block = cg::this_thread_block();
         auto warp = cg::tiled_partition<32>(block);
-        const uint bucket_idx = block.group_index().x;
+        const uint warp_in_block = warp.meta_group_rank();
+        const uint bucket_idx = block.group_index().x * config::blend_backward_warps_per_block + warp_in_block;
         const uint lane_idx = warp.thread_rank();
 
         // launched with an upper bound of the bucket count
@@ -389,9 +390,13 @@ namespace faster_gs::rasterization::kernels::backward {
         float transmittance;
 
         bucket_color_transmittance += bucket_idx * config::block_size_blend;
-        __shared__ uint collected_last_contributor[64];
-        __shared__ float4 collected_color_pixel_after_transmittance[32];
-        __shared__ float4 collected_grad_info_pixel[64];
+        __shared__ uint collected_last_contributor_all[config::blend_backward_warps_per_block][64];
+        __shared__ float4 collected_color_pixel_after_transmittance_all[config::blend_backward_warps_per_block][32];
+        __shared__ float4 collected_grad_info_pixel_all[config::blend_backward_warps_per_block][64];
+        // every warp works on its own bucket with its own buffers (no block-level synchronization)
+        uint* collected_last_contributor = collected_last_contributor_all[warp_in_block];
+        float4* collected_color_pixel_after_transmittance = collected_color_pixel_after_transmittance_all[warp_in_block];
+        float4* collected_grad_info_pixel = collected_grad_info_pixel_all[warp_in_block];
 
         // iterate over all pixels in the tile
         #pragma unroll

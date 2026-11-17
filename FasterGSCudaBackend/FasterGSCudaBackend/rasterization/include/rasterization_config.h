@@ -55,6 +55,9 @@ namespace faster_gs::rasterization::config {
     DEF int tile_width = 16;
     DEF int tile_height = 12;
     DEF int block_size_blend = tile_width * tile_height; // 192
+    // Faster-GS+LeanShuffle-2W: independent buckets (one per warp) per block of blend_backward_cu; with one warp per block
+    // the per-SM block limit (16 on sm_86, 24 on sm_120) caps the resident warps below the register limit (32 at 64 regs)
+    DEF int blend_backward_warps_per_block = 2;
     DEF int subtile_width = 8;
     DEF int subtile_height = 4;
     DEF int subgrid_width = tile_width / subtile_width; // 2
