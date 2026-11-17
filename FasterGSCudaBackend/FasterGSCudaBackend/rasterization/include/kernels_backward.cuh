@@ -1,4 +1,5 @@
 #pragma once
+#include "lazy_adam_device.cuh"
 
 #include "rasterization_config.h"
 #include "kernel_utils.cuh"
@@ -32,6 +33,7 @@ namespace faster_gs::rasterization::kernels::backward {
         float3* __restrict__ grad_sh_coefficients_rest,
         float* __restrict__ densification_info,
         uint8_t* __restrict__ visibility,
+        const faster_gs::adam::FusedShAdamArgs fused_sh_adam,
         const uint n_primitives,
         const uint active_sh_bases,
         const uint total_sh_bases,
@@ -86,9 +88,25 @@ namespace faster_gs::rasterization::kernels::backward {
         const uint n_floats_warp = min(warp_size, n_primitives - warp_primitive_offset) * 3 * total_sh_bases;
         const float* collected_grad_sh_coefficients_rest_warp = reinterpret_cast<const float*>(collected_grad_sh_coefficients_rest + warp.meta_group_rank() * warp_size * total_sh_bases);
         float* grad_sh_coefficients_rest_warp = reinterpret_cast<float*>(grad_sh_coefficients_rest + warp_primitive_offset * total_sh_bases);
-        const uint n_float4_warp = n_floats_warp / 4;
-        for (uint i = lane_idx; i < n_float4_warp; i += warp_size) reinterpret_cast<float4*>(grad_sh_coefficients_rest_warp)[i] = reinterpret_cast<const float4*>(collected_grad_sh_coefficients_rest_warp)[i];
-        for (uint i = 4 * n_float4_warp + lane_idx; i < n_floats_warp; i += warp_size) grad_sh_coefficients_rest_warp[i] = collected_grad_sh_coefficients_rest_warp[i];
+        if (fused_sh_adam.exp_avg != nullptr) {
+            // Faster-GS+FusedShAdam: instead of writing the gradient, apply the lazy Adam step of the visible Gaussians in place
+            // (coalesced over the warp's 32 * 3 * total_sh_bases values; the SH coefficients of this warp's Gaussians were read
+            // above for the color backward pass of the same threads, and no other warp touches them)
+            const uint active_mask = warp.ballot(active);
+            const uint floats_per_primitive = 3 * total_sh_bases;
+            const int warp_float_offset = static_cast<int>(warp_primitive_offset * floats_per_primitive);
+            for (uint i = lane_idx; i < n_floats_warp; i += warp_size) {
+                const uint local_primitive = floats_per_primitive == 45 ? i / 45 : i / floats_per_primitive;
+                if (((active_mask >> local_primitive) & 1u) == 0) continue;
+                faster_gs::adam::fused_adam_element(fused_sh_adam, warp_float_offset + static_cast<int>(i),
+                                                    static_cast<int>(warp_primitive_offset + local_primitive), collected_grad_sh_coefficients_rest_warp[i]);
+            }
+        }
+        else {
+            const uint n_float4_warp = n_floats_warp / 4;
+            for (uint i = lane_idx; i < n_float4_warp; i += warp_size) reinterpret_cast<float4*>(grad_sh_coefficients_rest_warp)[i] = reinterpret_cast<const float4*>(collected_grad_sh_coefficients_rest_warp)[i];
+            for (uint i = 4 * n_float4_warp + lane_idx; i < n_floats_warp; i += warp_size) grad_sh_coefficients_rest_warp[i] = collected_grad_sh_coefficients_rest_warp[i];
+        }
 
         if (!active) return;
 

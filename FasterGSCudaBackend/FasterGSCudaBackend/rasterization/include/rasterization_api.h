@@ -57,7 +57,19 @@ namespace faster_gs::rasterization {
         const bool proper_antialiasing,
         const int n_instances,
         const int n_buckets,
-        const int instance_primitive_indices_selector);
+        const int instance_primitive_indices_selector,
+        // Faster-GS+FusedShAdam: optimizer state of the SH rest coefficients (empty exp_avg: not fused)
+        const torch::Tensor& fused_exp_avg,
+        const torch::Tensor& fused_exp_avg_sq,
+        const torch::Tensor& fused_last_step,
+        const torch::Tensor& fused_f_table,
+        const torch::Tensor& fused_step_size_table,
+        const torch::Tensor& fused_bias_correction2_sqrt_rcp_table,
+        const int fused_step,
+        const double fused_learning_rate,
+        const double fused_beta1,
+        const double fused_beta2,
+        const double fused_epsilon);
 
     torch::Tensor
     inference_wrapper(

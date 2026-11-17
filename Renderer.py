@@ -121,6 +121,8 @@ class FasterGSRenderer(BaseRenderer):
             densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
             rasterizer_settings=settings,
             visibility=self.model.gaussians.visibility_buffer,
+            # Faster-GS+FusedShAdam: the SH rest coefficients are updated inside the backward pass (None if not applicable)
+            fused_sh_adam=optimizer.fused_sh_rest(self.model.gaussians.sh_coefficients_rest) if hasattr(optimizer, 'fused_sh_rest') else None,
         )
         if self.model.ppisp is not None:
             image = self.model.ppisp(image, view)

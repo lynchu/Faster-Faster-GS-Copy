@@ -1,4 +1,5 @@
 #include "lazy_adam.h"
+#include "lazy_adam_device.cuh"
 #include "adam_config.h"
 #include "torch_utils.h"
 #include "utils.h"
@@ -12,20 +13,6 @@
 
 namespace faster_gs::adam {
 
-    // Faster-GS+Combo-SR: m and v can each be float32 or bfloat16 (all arithmetic in float32). With round-to-nearest,
-    // bfloat16 cannot represent the per-step decay v <- 0.999 v, so a bfloat16 v is stored with unbiased stochastic
-    // rounding (see Faster-GS+HalfMoments-SR); m uses round-to-nearest.
-    __device__ __forceinline__ uint32_t hash32(uint32_t x) {
-        x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
-        return x;
-    }
-    __device__ __forceinline__ void store_moment_sr(float* p, int i, float v, uint32_t) { p[i] = v; }
-    __device__ __forceinline__ void store_moment_sr(__nv_bfloat16* p, int i, float v, uint32_t r) {
-        p[i] = __ushort_as_bfloat16(static_cast<unsigned short>((__float_as_uint(v) + (r & 0xFFFFU)) >> 16));
-    }
-    inline uint32_t sr_seed(const int step, const int n_elements, const uint32_t kernel_salt) {
-        return static_cast<uint32_t>(step) * 0x9E3779B1U ^ static_cast<uint32_t>(n_elements) * 0x85EBCA77U ^ kernel_salt * 0xC2B2AE3DU;
-    }
     template <typename F>
     void dispatch_moments(const torch::Tensor& exp_avg, const torch::Tensor& exp_avg_sq, F&& launch) {
         const bool m_half = exp_avg.scalar_type() == torch::kBFloat16;
@@ -35,54 +22,9 @@ namespace faster_gs::adam {
         else if (v_half) launch(static_cast<float*>(nullptr), static_cast<__nv_bfloat16*>(nullptr));
         else launch(static_cast<float*>(nullptr), static_cast<float*>(nullptr));
     }
-    __device__ __forceinline__ float load_moment(const float* p, int i) { return p[i]; }
-    __device__ __forceinline__ float load_moment(const __nv_bfloat16* p, int i) { return __bfloat162float(p[i]); }
-    __device__ __forceinline__ void store_moment(float* p, int i, float v) { p[i] = v; }
-    __device__ __forceinline__ void store_moment(__nv_bfloat16* p, int i, float v) { p[i] = __float2bfloat16_rn(v); }
     template <typename T> T* moment_ptr(const torch::Tensor& t);
     template <> inline float* moment_ptr<float>(const torch::Tensor& t) { return t.data_ptr<float>(); }
     template <> inline __nv_bfloat16* moment_ptr<__nv_bfloat16>(const torch::Tensor& t) { return reinterpret_cast<__nv_bfloat16*>(t.data_ptr<at::BFloat16>()); }
-
-
-    // zero-gradient steps beyond this window change the parameter by less than beta1^256 ~ 2e-12 of the momentum displacement
-    constexpr int max_explicit_steps = 256;
-
-    // application of k >= 1 zero-gradient Adam steps following step t0
-    __device__ __forceinline__ void catch_up(
-        float& param, float& moment1, float& moment2,
-        const int t0, const int k,
-        const float* __restrict__ f_table,
-        const float* __restrict__ step_size_table,
-        const float* __restrict__ bias_correction2_sqrt_rcp_table,
-        const float beta1, const float beta2, const float epsilon,
-        const float log2_gamma, const float log2_beta1, const float log2_beta2)
-    {
-        const int window = min(k, max_explicit_steps);
-        // epsilon is negligible (< 1e-6 relative) if sqrt(v) stays above 1e6 * epsilon over the significant window
-        const float sqrt_v_window_end = sqrtf(moment2 * exp2f(static_cast<float>(window) * log2_beta2));
-        if (sqrt_v_window_end >= 1e6f * epsilon) {
-            // closed form: theta -= m / sqrt(v) * sum_j f(t0 + j) gamma^j (float32 suffices: the relative error of the
-            // displacement is ~1e-6, i.e., orders of magnitude below the float32 spacing of the parameter; FP64 would be
-            // 64x slower on this GPU class)
-            const float displacement_scale = f_table[t0] - exp2f(static_cast<float>(k) * log2_gamma) * f_table[t0 + k];
-            param -= moment1 * rsqrtf(moment2) * displacement_scale;
-            moment1 *= exp2f(static_cast<float>(k) * log2_beta1);
-            moment2 *= exp2f(static_cast<float>(k) * log2_beta2);
-        } else {
-            // tiny second moment: replay the zero-gradient steps with exactly the arithmetic of adam_step_cu
-            for (int j = 1; j <= window; ++j) {
-                const int s = t0 + j;
-                moment1 = fmaf(beta1, moment1, 0.0f);
-                moment2 = fmaf(beta2, moment2, 0.0f);
-                const float denom = sqrtf(moment2) * bias_correction2_sqrt_rcp_table[s] + epsilon;
-                param -= step_size_table[s] * moment1 / denom;
-            }
-            if (k > window) {
-                moment1 *= exp2f(static_cast<float>(k - window) * log2_beta1);
-                moment2 *= exp2f(static_cast<float>(k - window) * log2_beta2);
-            }
-        }
-    }
 
     template <typename M1, typename M2>
     __global__ void lazy_adam_step_cu(

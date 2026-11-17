@@ -1,4 +1,5 @@
 #pragma once
+#include "lazy_adam_device.cuh"
 
 #include <cstdint>
 
@@ -33,6 +34,7 @@ namespace faster_gs::rasterization {
         float2* grad_mean2d_abs_helper,
         float* densification_info,
         uint8_t* visibility,
+        const faster_gs::adam::FusedShAdamArgs& fused_sh_adam,
         const int n_primitives,
         const int n_instances,
         const int n_buckets,

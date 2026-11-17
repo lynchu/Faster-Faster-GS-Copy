@@ -38,6 +38,10 @@ class RasterizerSettings(NamedTuple):
         )
 
 
+# Faster-GS+FusedShAdam: backward arguments when the SH rest coefficients are not updated in the backward pass
+_NOT_FUSED = (torch.empty(0), torch.empty(0), torch.empty(0, dtype=torch.int32), torch.empty(0), torch.empty(0), torch.empty(0), 0, 0.0, 0.0, 0.0, 0.0)
+
+
 class _Rasterize(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -51,6 +55,7 @@ class _Rasterize(torch.autograd.Function):
         densification_info: torch.Tensor,
         rasterizer_settings: RasterizerSettings,
         visibility: torch.Tensor,
+        fused_sh_adam: Any,
     ) -> torch.Tensor:
         (
             image,
@@ -82,6 +87,7 @@ class _Rasterize(torch.autograd.Function):
         ctx.densification_info = densification_info
         ctx.mark_non_differentiable(densification_info)
         ctx.visibility = visibility
+        ctx.fused_sh_adam = fused_sh_adam
         return image
 
     @staticmethod
@@ -100,7 +106,11 @@ class _Rasterize(torch.autograd.Function):
             *ctx.saved_tensors,
             *ctx.rasterizer_settings.as_tuple(),
             *ctx.buffer_state,
+            # Faster-GS+FusedShAdam: the SH rest coefficients are updated inside the backward pass (gradient None)
+            *(ctx.fused_sh_adam.backward_args() if ctx.fused_sh_adam is not None else _NOT_FUSED),
         )
+        if ctx.fused_sh_adam is not None:
+            ctx.fused_sh_adam.done()
         return (
             grad_means,
             grad_scales,
@@ -111,6 +121,7 @@ class _Rasterize(torch.autograd.Function):
             None,  # densification_info
             None,  # rasterizer_settings
             None,  # visibility
+            None,  # fused_sh_adam
         )
 
 
@@ -124,6 +135,7 @@ def diff_rasterize(
     densification_info: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
     visibility: torch.Tensor | None = None,
+    fused_sh_adam: Any = None,
 ) -> torch.Tensor:
     return _Rasterize.apply(
         means,
@@ -135,6 +147,7 @@ def diff_rasterize(
         densification_info,
         rasterizer_settings,
         visibility if visibility is not None else torch.empty(0, dtype=torch.uint8),
+        fused_sh_adam,
     )
 
 
