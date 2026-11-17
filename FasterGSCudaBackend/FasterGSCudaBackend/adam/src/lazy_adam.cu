@@ -6,11 +6,35 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cmath>
 #include <cuda_bf16.h>
+#include <cstdint>
+#include <type_traits>
 #include "helper_math.h"
 
 namespace faster_gs::adam {
 
-    // Faster-GS+HalfMoments-SH: moments can be float32 or bfloat16 (all arithmetic in float32)
+    // Faster-GS+Combo-SR: m and v can each be float32 or bfloat16 (all arithmetic in float32). With round-to-nearest,
+    // bfloat16 cannot represent the per-step decay v <- 0.999 v, so a bfloat16 v is stored with unbiased stochastic
+    // rounding (see Faster-GS+HalfMoments-SR); m uses round-to-nearest.
+    __device__ __forceinline__ uint32_t hash32(uint32_t x) {
+        x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+        return x;
+    }
+    __device__ __forceinline__ void store_moment_sr(float* p, int i, float v, uint32_t) { p[i] = v; }
+    __device__ __forceinline__ void store_moment_sr(__nv_bfloat16* p, int i, float v, uint32_t r) {
+        p[i] = __ushort_as_bfloat16(static_cast<unsigned short>((__float_as_uint(v) + (r & 0xFFFFU)) >> 16));
+    }
+    inline uint32_t sr_seed(const int step, const int n_elements, const uint32_t kernel_salt) {
+        return static_cast<uint32_t>(step) * 0x9E3779B1U ^ static_cast<uint32_t>(n_elements) * 0x85EBCA77U ^ kernel_salt * 0xC2B2AE3DU;
+    }
+    template <typename F>
+    void dispatch_moments(const torch::Tensor& exp_avg, const torch::Tensor& exp_avg_sq, F&& launch) {
+        const bool m_half = exp_avg.scalar_type() == torch::kBFloat16;
+        const bool v_half = exp_avg_sq.scalar_type() == torch::kBFloat16;
+        if (m_half && v_half) launch(static_cast<__nv_bfloat16*>(nullptr), static_cast<__nv_bfloat16*>(nullptr));
+        else if (m_half) launch(static_cast<__nv_bfloat16*>(nullptr), static_cast<float*>(nullptr));
+        else if (v_half) launch(static_cast<float*>(nullptr), static_cast<__nv_bfloat16*>(nullptr));
+        else launch(static_cast<float*>(nullptr), static_cast<float*>(nullptr));
+    }
     __device__ __forceinline__ float load_moment(const float* p, int i) { return p[i]; }
     __device__ __forceinline__ float load_moment(const __nv_bfloat16* p, int i) { return __bfloat162float(p[i]); }
     __device__ __forceinline__ void store_moment(float* p, int i, float v) { p[i] = v; }
@@ -60,12 +84,12 @@ namespace faster_gs::adam {
         }
     }
 
-    template <typename MomentT>
+    template <typename M1, typename M2>
     __global__ void lazy_adam_step_cu(
         const float* __restrict__ param_grad,
         float* __restrict__ param,
-        MomentT* __restrict__ exp_avg,
-        MomentT* __restrict__ exp_avg_sq,
+        M1* __restrict__ exp_avg,
+        M2* __restrict__ exp_avg_sq,
         const uint8_t* __restrict__ visibility,
         const int* __restrict__ last_step,
         const float* __restrict__ f_table,
@@ -81,7 +105,8 @@ namespace faster_gs::adam {
         const float bias_correction2_sqrt_rcp,
         const float log2_gamma,
         const float log2_beta1,
-        const float log2_beta2)
+        const float log2_beta2,
+        const uint32_t seed)
     {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= n_elements) return;
@@ -101,14 +126,14 @@ namespace faster_gs::adam {
         const float denom = sqrtf(moment2) * bias_correction2_sqrt_rcp + epsilon;
         param[idx] = p - step_size * moment1 / denom;
         store_moment(exp_avg, idx, moment1);
-        store_moment(exp_avg_sq, idx, moment2);
+        store_moment_sr(exp_avg_sq, idx, moment2, hash32(static_cast<uint32_t>(idx) ^ seed));
     }
 
-    template <typename MomentT>
+    template <typename M1, typename M2>
     __global__ void lazy_adam_flush_cu(
         float* __restrict__ param,
-        MomentT* __restrict__ exp_avg,
-        MomentT* __restrict__ exp_avg_sq,
+        M1* __restrict__ exp_avg,
+        M2* __restrict__ exp_avg_sq,
         const int* __restrict__ last_step,
         const float* __restrict__ f_table,
         const float* __restrict__ step_size_table,
@@ -121,7 +146,8 @@ namespace faster_gs::adam {
         const float epsilon,
         const float log2_gamma,
         const float log2_beta1,
-        const float log2_beta2)
+        const float log2_beta2,
+        const uint32_t seed)
     {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= n_elements) return;
@@ -135,7 +161,7 @@ namespace faster_gs::adam {
         catch_up(p, m1, m2, t0, k, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log2_gamma, log2_beta1, log2_beta2);
         param[idx] = p;
         store_moment(exp_avg, idx, m1);
-        store_moment(exp_avg_sq, idx, m2);
+        store_moment_sr(exp_avg_sq, idx, m2, hash32(static_cast<uint32_t>(idx) ^ seed));
     }
 
     __global__ void lazy_adam_mark_cu(
@@ -210,11 +236,11 @@ namespace faster_gs::adam {
         candidates[idx] = (overlaps || !isfinite(ex) || !isfinite(ey)) ? 1 : 0;
     }
 
-    template <typename MomentT>
+    template <typename M1, typename M2>
     __global__ void lazy_adam_flush_masked_cu(
         float* __restrict__ param,
-        MomentT* __restrict__ exp_avg,
-        MomentT* __restrict__ exp_avg_sq,
+        M1* __restrict__ exp_avg,
+        M2* __restrict__ exp_avg_sq,
         const uint8_t* __restrict__ mask,
         const int* __restrict__ last_step,
         const float* __restrict__ f_table,
@@ -224,7 +250,8 @@ namespace faster_gs::adam {
         const int n_elements_per_gaussian,
         const int target_step,
         const float beta1, const float beta2, const float epsilon,
-        const float log2_gamma, const float log2_beta1, const float log2_beta2)
+        const float log2_gamma, const float log2_beta1, const float log2_beta2,
+        const uint32_t seed)
     {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= n_elements) return;
@@ -237,7 +264,7 @@ namespace faster_gs::adam {
         catch_up(p, m1, m2, t0, k, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log2_gamma, log2_beta1, log2_beta2);
         param[idx] = p;
         store_moment(exp_avg, idx, m1);
-        store_moment(exp_avg_sq, idx, m2);
+        store_moment_sr(exp_avg_sq, idx, m2, hash32(static_cast<uint32_t>(idx) ^ seed));
     }
 
     __global__ void lazy_mark_masked_cu(const uint8_t* __restrict__ mask, int* __restrict__ last_step, const int n, const int target_step) {
@@ -281,23 +308,17 @@ namespace faster_gs::adam {
         const int n_gaussians = last_step.size(0);
         if (n_elements == 0) return;
         TORCH_CHECK(n_elements % n_gaussians == 0, "lazy_adam_flush_masked: parameter size is not a multiple of the number of Gaussians");
-        if (exp_avg.scalar_type() == torch::kBFloat16) {
-            using MomentT = __nv_bfloat16;
-            lazy_adam_flush_masked_cu<MomentT><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
-                param.data_ptr<float>(), moment_ptr<MomentT>(exp_avg), moment_ptr<MomentT>(exp_avg_sq), mask.data_ptr<uint8_t>(), last_step.data_ptr<int>(),
+        dispatch_moments(exp_avg, exp_avg_sq, [&](auto m1_tag, auto m2_tag) {
+            using M1 = std::remove_pointer_t<decltype(m1_tag)>;
+            using M2 = std::remove_pointer_t<decltype(m2_tag)>;
+            lazy_adam_flush_masked_cu<M1, M2><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
+                param.data_ptr<float>(), moment_ptr<M1>(exp_avg), moment_ptr<M2>(exp_avg_sq), mask.data_ptr<uint8_t>(), last_step.data_ptr<int>(),
                 f_table.data_ptr<float>(), step_size_table.data_ptr<float>(), bias_correction2_sqrt_rcp_table.data_ptr<float>(),
                 n_elements, n_elements / n_gaussians, target_step,
                 static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(epsilon),
-                static_cast<float>(std::log2(beta1 / std::sqrt(beta2))), static_cast<float>(std::log2(beta1)), static_cast<float>(std::log2(beta2)));
-        } else {
-            using MomentT = float;
-            lazy_adam_flush_masked_cu<MomentT><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
-                param.data_ptr<float>(), moment_ptr<MomentT>(exp_avg), moment_ptr<MomentT>(exp_avg_sq), mask.data_ptr<uint8_t>(), last_step.data_ptr<int>(),
-                f_table.data_ptr<float>(), step_size_table.data_ptr<float>(), bias_correction2_sqrt_rcp_table.data_ptr<float>(),
-                n_elements, n_elements / n_gaussians, target_step,
-                static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(epsilon),
-                static_cast<float>(std::log2(beta1 / std::sqrt(beta2))), static_cast<float>(std::log2(beta1)), static_cast<float>(std::log2(beta2)));
-        }
+                static_cast<float>(std::log2(beta1 / std::sqrt(beta2))), static_cast<float>(std::log2(beta1)), static_cast<float>(std::log2(beta2)),
+                sr_seed(target_step, n_elements, 3));
+        });
         CHECK_CUDA(config::debug, "lazy_adam_flush_masked")
     }
 
@@ -349,13 +370,14 @@ namespace faster_gs::adam {
         const double bias_correction1_rcp = 1.0 / (1.0 - std::pow(beta1, step_count));
         const double bias_correction2_sqrt_rcp = 1.0 / std::sqrt(1.0 - std::pow(beta2, step_count));
         const double step_size = learning_rate * bias_correction1_rcp;
-        if (exp_avg.scalar_type() == torch::kBFloat16) {
-            using MomentT = __nv_bfloat16;
-            lazy_adam_step_cu<MomentT><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
+        dispatch_moments(exp_avg, exp_avg_sq, [&](auto m1_tag, auto m2_tag) {
+            using M1 = std::remove_pointer_t<decltype(m1_tag)>;
+            using M2 = std::remove_pointer_t<decltype(m2_tag)>;
+            lazy_adam_step_cu<M1, M2><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
                 param_grad.data_ptr<float>(),
                 param.data_ptr<float>(),
-                moment_ptr<MomentT>(exp_avg),
-                moment_ptr<MomentT>(exp_avg_sq),
+                moment_ptr<M1>(exp_avg),
+                moment_ptr<M2>(exp_avg_sq),
                 visibility.data_ptr<uint8_t>(),
                 last_step.data_ptr<int>(),
                 f_table.data_ptr<float>(),
@@ -371,33 +393,9 @@ namespace faster_gs::adam {
                 static_cast<float>(bias_correction2_sqrt_rcp),
                 static_cast<float>(std::log2(beta1 / std::sqrt(beta2))),
                 static_cast<float>(std::log2(beta1)),
-                static_cast<float>(std::log2(beta2))
-            );
-        } else {
-            using MomentT = float;
-            lazy_adam_step_cu<MomentT><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
-                param_grad.data_ptr<float>(),
-                param.data_ptr<float>(),
-                moment_ptr<MomentT>(exp_avg),
-                moment_ptr<MomentT>(exp_avg_sq),
-                visibility.data_ptr<uint8_t>(),
-                last_step.data_ptr<int>(),
-                f_table.data_ptr<float>(),
-                step_size_table.data_ptr<float>(),
-                bias_correction2_sqrt_rcp_table.data_ptr<float>(),
-                n_elements,
-                n_elements / n_gaussians,
-                step_count,
-                static_cast<float>(step_size),
-                static_cast<float>(beta1),
-                static_cast<float>(beta2),
-                static_cast<float>(epsilon),
-                static_cast<float>(bias_correction2_sqrt_rcp),
-                static_cast<float>(std::log2(beta1 / std::sqrt(beta2))),
-                static_cast<float>(std::log2(beta1)),
-                static_cast<float>(std::log2(beta2))
-            );
-        }
+                static_cast<float>(std::log2(beta2)),
+                sr_seed(step_count, n_elements, 1));
+        });
         CHECK_CUDA(config::debug, "lazy_adam_step")
     }
 
@@ -419,12 +417,13 @@ namespace faster_gs::adam {
         const int n_gaussians = last_step.size(0);
         if (n_elements == 0) return;
         TORCH_CHECK(n_elements % n_gaussians == 0, "lazy_adam_flush: parameter size is not a multiple of the number of Gaussians");
-        if (exp_avg.scalar_type() == torch::kBFloat16) {
-            using MomentT = __nv_bfloat16;
-            lazy_adam_flush_cu<MomentT><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
+        dispatch_moments(exp_avg, exp_avg_sq, [&](auto m1_tag, auto m2_tag) {
+            using M1 = std::remove_pointer_t<decltype(m1_tag)>;
+            using M2 = std::remove_pointer_t<decltype(m2_tag)>;
+            lazy_adam_flush_cu<M1, M2><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
                 param.data_ptr<float>(),
-                moment_ptr<MomentT>(exp_avg),
-                moment_ptr<MomentT>(exp_avg_sq),
+                moment_ptr<M1>(exp_avg),
+                moment_ptr<M2>(exp_avg_sq),
                 last_step.data_ptr<int>(),
                 f_table.data_ptr<float>(),
                 step_size_table.data_ptr<float>(),
@@ -437,29 +436,9 @@ namespace faster_gs::adam {
                 static_cast<float>(epsilon),
                 static_cast<float>(std::log2(beta1 / std::sqrt(beta2))),
                 static_cast<float>(std::log2(beta1)),
-                static_cast<float>(std::log2(beta2))
-            );
-        } else {
-            using MomentT = float;
-            lazy_adam_flush_cu<MomentT><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
-                param.data_ptr<float>(),
-                moment_ptr<MomentT>(exp_avg),
-                moment_ptr<MomentT>(exp_avg_sq),
-                last_step.data_ptr<int>(),
-                f_table.data_ptr<float>(),
-                step_size_table.data_ptr<float>(),
-                bias_correction2_sqrt_rcp_table.data_ptr<float>(),
-                n_elements,
-                n_elements / n_gaussians,
-                target_step,
-                static_cast<float>(beta1),
-                static_cast<float>(beta2),
-                static_cast<float>(epsilon),
-                static_cast<float>(std::log2(beta1 / std::sqrt(beta2))),
-                static_cast<float>(std::log2(beta1)),
-                static_cast<float>(std::log2(beta2))
-            );
-        }
+                static_cast<float>(std::log2(beta2)),
+                sr_seed(target_step, n_elements, 2));
+        });
         CHECK_CUDA(config::debug, "lazy_adam_flush")
     }
 

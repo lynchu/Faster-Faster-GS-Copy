@@ -50,6 +50,7 @@ class LazyAdam(FusedAdam):
         super().__init__(params=params, lr=lr, eps=eps)
         # Faster-GS+LazyAdam-Exact: bring every Gaussian that may be visible up to date before the forward pass
         self.exact = exact
+        self.moment_dtypes = (torch.bfloat16, torch.bfloat16)
         self.candidates = None
         self.check_staleness = False
         self.stale_visible_counts = []
@@ -150,16 +151,18 @@ class LazyAdam(FusedAdam):
             if param.numel() == 0:
                 continue
             state = self.state[param]
-            # Faster-GS+HalfMoments-SH: bfloat16 moments for the SH rest coefficients only
-            half = group.get('name') == 'sh_coefficients_rest'
+            # Faster-GS+Combo-SR: bfloat16 m (round-to-nearest) and v (stochastic rounding in the kernels)
+            m_dtype, v_dtype = self.moment_dtypes
             if len(state) == 0:
                 state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(param, dtype=torch.bfloat16 if half else torch.float32)
-                state['exp_avg_sq'] = torch.zeros_like(param, dtype=torch.bfloat16 if half else torch.float32)
-            elif half and state['exp_avg'].dtype != torch.bfloat16:
+                state['exp_avg'] = torch.zeros_like(param, dtype=m_dtype)
+                state['exp_avg_sq'] = torch.zeros_like(param, dtype=v_dtype)
+            else:
                 # NeRFICG's extend_param_groups concatenates float32 zeros, which promotes the state to float32
-                state['exp_avg'] = state['exp_avg'].to(torch.bfloat16)
-                state['exp_avg_sq'] = state['exp_avg_sq'].to(torch.bfloat16)
+                if state['exp_avg'].dtype != m_dtype:
+                    state['exp_avg'] = state['exp_avg'].to(m_dtype)
+                if state['exp_avg_sq'].dtype != v_dtype:
+                    state['exp_avg_sq'] = state['exp_avg_sq'].to(v_dtype)
             state['step'] += 1
             if state['step'] != self.step_count:
                 raise RuntimeError('LazyAdam: parameter groups are out of step')
