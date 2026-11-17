@@ -449,7 +449,10 @@ namespace faster_gs::rasterization::kernels::backward {
 
             // which pixel index should this thread deal with?
             const int idx = i - static_cast<int>(lane_idx);
-            const uint2 pixel_coords = {start_pixel_coords.x + idx % config::tile_width, start_pixel_coords.y + idx / config::tile_width};
+            // Faster-GS+BwdHoist: unsigned arithmetic (shift / mask instead of signed division); negative indices of the
+            // pipeline head map to out-of-range coordinates and are skipped anyway
+            const uint idx_u = static_cast<uint>(idx);
+            const uint2 pixel_coords = {start_pixel_coords.x + idx_u % config::tile_width, start_pixel_coords.y + idx_u / config::tile_width};
             const bool valid_pixel = pixel_coords.x < width && pixel_coords.y < height;
 
             // leader thread loads values from shared memory into registers
@@ -480,9 +483,9 @@ namespace faster_gs::rasterization::kernels::backward {
 
             const float blending_weight = transmittance * alpha;
 
-            // color gradient
-            const float3 dL_dcolor = blending_weight * grad_color_pixel * color_grad_factor;
-            dL_dcolor_accum += dL_dcolor;
+            // color gradient (Faster-GS+BwdHoist: the per-Gaussian factor color_grad_factor is applied once after the loop)
+            if constexpr (compute_abs_grad) dL_dcolor_accum += blending_weight * grad_color_pixel * color_grad_factor;
+            else dL_dcolor_accum += blending_weight * grad_color_pixel;
 
             color_pixel_after -= blending_weight * color;
 
@@ -498,20 +501,40 @@ namespace faster_gs::rasterization::kernels::backward {
 
             // conic and mean2d gradient
             const float gaussian_grad_helper = -alpha * dL_dalpha;
-            const float3 dL_dconic = 0.5f * gaussian_grad_helper * make_float3(
-                delta.x * delta.x,
-                delta.x * delta.y,
-                delta.y * delta.y
-            );
-            dL_dconic_accum += dL_dconic;
-            const float2 dL_dmean2d = gaussian_grad_helper * make_float2(
-                conic.x * delta.x + conic.y * delta.y,
-                conic.y * delta.x + conic.z * delta.y
-            );
-            dL_dmean2d_accum += dL_dmean2d;
-            if constexpr (compute_abs_grad) dL_dmean2d_abs_accum += fabsf(dL_dmean2d);
+            if constexpr (compute_abs_grad) {
+                const float3 dL_dconic = 0.5f * gaussian_grad_helper * make_float3(
+                    delta.x * delta.x,
+                    delta.x * delta.y,
+                    delta.y * delta.y
+                );
+                dL_dconic_accum += dL_dconic;
+                const float2 dL_dmean2d = gaussian_grad_helper * make_float2(
+                    conic.x * delta.x + conic.y * delta.y,
+                    conic.y * delta.x + conic.z * delta.y
+                );
+                dL_dmean2d_accum += dL_dmean2d;
+                dL_dmean2d_abs_accum += fabsf(dL_dmean2d);
+            }
+            else {
+                // Faster-GS+BwdHoist: the conic and the factor 1/2 are constant per Gaussian, so only h * delta and
+                // h * delta delta^T are accumulated here; dL/dmean2d = C * sum(h * delta), dL/dconic = sum(h * delta delta^T) / 2
+                const float h_dx = gaussian_grad_helper * delta.x;
+                const float h_dy = gaussian_grad_helper * delta.y;
+                dL_dconic_accum += make_float3(h_dx * delta.x, h_dx * delta.y, h_dy * delta.y);
+                dL_dmean2d_accum += make_float2(h_dx, h_dy);
+            }
 
             transmittance *= one_minus_alpha;
+        }
+
+        // Faster-GS+BwdHoist: apply the per-Gaussian factors that were taken out of the pixel loop
+        if constexpr (!compute_abs_grad) {
+            dL_dcolor_accum *= color_grad_factor;
+            dL_dconic_accum *= 0.5f;
+            dL_dmean2d_accum = make_float2(
+                conic.x * dL_dmean2d_accum.x + conic.y * dL_dmean2d_accum.y,
+                conic.y * dL_dmean2d_accum.x + conic.z * dL_dmean2d_accum.y
+            );
         }
 
         // finally add the gradients using atomics
