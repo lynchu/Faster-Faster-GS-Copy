@@ -267,6 +267,109 @@ namespace faster_gs::adam {
         store_moment_sr(exp_avg_sq, idx, m2, hash32(static_cast<uint32_t>(idx) ^ seed));
     }
 
+
+    // Faster-GS+WarpLazy: one warp per 32 consecutive Gaussians instead of one thread per parameter element. The warp reads
+    // the 32 flags (visibility for the step, candidate mask for the pre-forward catch-up) and last_step values once, exits
+    // if none of its Gaussians has work (Gaussians are Morton-ordered, so invisible ones come in runs), and otherwise walks
+    // the 32 * D contiguous elements with coalesced accesses (e / D with a compile-time D). The per-element arithmetic and
+    // the stochastic-rounding seeds are identical to lazy_adam_step_cu / lazy_adam_flush_masked_cu. The per-element
+    // kernels launched N * D threads that mostly returned after a runtime integer division (ncu, A6000: the SH-rest
+    // masked flush took 1.27 ms at 1.3% DRAM throughput).
+    constexpr int warp_lazy_warps_per_block = 8;
+
+    template <typename M1, typename M2, int D, bool is_step>
+    __global__ void __launch_bounds__(32 * warp_lazy_warps_per_block) lazy_adam_warp_cu(
+        const float* __restrict__ param_grad,
+        float* __restrict__ param,
+        M1* __restrict__ exp_avg,
+        M2* __restrict__ exp_avg_sq,
+        const uint8_t* __restrict__ flags,
+        const int* __restrict__ last_step,
+        const float* __restrict__ f_table,
+        const float* __restrict__ step_size_table,
+        const float* __restrict__ bias_correction2_sqrt_rcp_table,
+        const int n_gaussians,
+        const int n_elements_per_gaussian_runtime,
+        const int step,  // is_step: the current step; otherwise the catch-up target step
+        const float step_size,
+        const float beta1,
+        const float beta2,
+        const float epsilon,
+        const float bias_correction2_sqrt_rcp,
+        const float log2_gamma,
+        const float log2_beta1,
+        const float log2_beta2,
+        const uint32_t seed)
+    {
+        __shared__ int collected_t0[warp_lazy_warps_per_block][32];
+        const int lane = threadIdx.x & 31;
+        const int warp_in_block = threadIdx.x >> 5;
+        const int g0 = (blockIdx.x * warp_lazy_warps_per_block + warp_in_block) * 32;
+        if (g0 >= n_gaussians) return;
+        const int g = g0 + lane;
+        const bool flagged = g < n_gaussians && flags[g] != 0;
+        const int t0 = flagged ? last_step[g] : 0;
+        const bool work = is_step ? flagged : (flagged && step - t0 > 0);
+        const unsigned work_mask = __ballot_sync(0xffffffffU, work);
+        if (work_mask == 0) return;
+        collected_t0[warp_in_block][lane] = t0;
+        __syncwarp();
+        const int dim = D > 0 ? D : n_elements_per_gaussian_runtime;
+        const int n_warp_elements = min(32, n_gaussians - g0) * dim;
+        const int base = g0 * dim;
+        for (int e = lane; e < n_warp_elements; e += 32) {
+            const int local_gaussian = e / dim;
+            if (((work_mask >> local_gaussian) & 1U) == 0) continue;
+            const int idx = base + e;
+            const int t0_e = collected_t0[warp_in_block][local_gaussian];
+            float p = param[idx];
+            float m1 = load_moment(exp_avg, idx);
+            float m2 = load_moment(exp_avg_sq, idx);
+            if constexpr (is_step) {
+                const int k = step - 1 - t0_e;
+                if (k > 0) catch_up(p, m1, m2, t0_e, k, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log2_gamma, log2_beta1, log2_beta2);
+                // regular step, identical to adam_step_cu
+                const float grad = param_grad[idx];
+                const float grad_sq = grad * grad;
+                const float moment1 = fmaf(beta1, m1 - grad, grad);
+                const float moment2 = fmaf(beta2, m2 - grad_sq, grad_sq);
+                const float denom = sqrtf(moment2) * bias_correction2_sqrt_rcp + epsilon;
+                param[idx] = p - step_size * moment1 / denom;
+                store_moment(exp_avg, idx, moment1);
+                store_moment_sr(exp_avg_sq, idx, moment2, hash32(static_cast<uint32_t>(idx) ^ seed));
+            }
+            else {
+                catch_up(p, m1, m2, t0_e, step - t0_e, f_table, step_size_table, bias_correction2_sqrt_rcp_table, beta1, beta2, epsilon, log2_gamma, log2_beta1, log2_beta2);
+                param[idx] = p;
+                store_moment(exp_avg, idx, m1);
+                store_moment_sr(exp_avg_sq, idx, m2, hash32(static_cast<uint32_t>(idx) ^ seed));
+            }
+        }
+    }
+
+    template <typename M1, typename M2, bool is_step>
+    void launch_lazy_adam_warp(
+        const float* param_grad, float* param, M1* exp_avg, M2* exp_avg_sq, const uint8_t* flags, const int* last_step,
+        const float* f_table, const float* step_size_table, const float* bias_correction2_sqrt_rcp_table,
+        const int n_gaussians, const int dim, const int step, const float step_size, const float beta1, const float beta2,
+        const float epsilon, const float bias_correction2_sqrt_rcp, const float log2_gamma, const float log2_beta1,
+        const float log2_beta2, const uint32_t seed)
+    {
+        const int n_blocks = div_round_up(n_gaussians, 32 * warp_lazy_warps_per_block);
+        const auto stream = at::cuda::getCurrentCUDAStream();
+#define FGS_LAZY_WARP_LAUNCH(DIM) lazy_adam_warp_cu<M1, M2, DIM, is_step><<<n_blocks, 32 * warp_lazy_warps_per_block, 0, stream>>>( \
+            param_grad, param, exp_avg, exp_avg_sq, flags, last_step, f_table, step_size_table, bias_correction2_sqrt_rcp_table, \
+            n_gaussians, dim, step, step_size, beta1, beta2, epsilon, bias_correction2_sqrt_rcp, log2_gamma, log2_beta1, log2_beta2, seed)
+        switch (dim) {
+            case 1: FGS_LAZY_WARP_LAUNCH(1); break;
+            case 3: FGS_LAZY_WARP_LAUNCH(3); break;
+            case 4: FGS_LAZY_WARP_LAUNCH(4); break;
+            case 45: FGS_LAZY_WARP_LAUNCH(45); break;
+            default: FGS_LAZY_WARP_LAUNCH(0); break;
+        }
+#undef FGS_LAZY_WARP_LAUNCH
+    }
+
     __global__ void lazy_mark_masked_cu(const uint8_t* __restrict__ mask, int* __restrict__ last_step, const int n, const int target_step) {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= n) return;
@@ -311,11 +414,11 @@ namespace faster_gs::adam {
         dispatch_moments(exp_avg, exp_avg_sq, [&](auto m1_tag, auto m2_tag) {
             using M1 = std::remove_pointer_t<decltype(m1_tag)>;
             using M2 = std::remove_pointer_t<decltype(m2_tag)>;
-            lazy_adam_flush_masked_cu<M1, M2><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
-                param.data_ptr<float>(), moment_ptr<M1>(exp_avg), moment_ptr<M2>(exp_avg_sq), mask.data_ptr<uint8_t>(), last_step.data_ptr<int>(),
+            launch_lazy_adam_warp<M1, M2, false>(
+                nullptr, param.data_ptr<float>(), moment_ptr<M1>(exp_avg), moment_ptr<M2>(exp_avg_sq), mask.data_ptr<uint8_t>(), last_step.data_ptr<int>(),
                 f_table.data_ptr<float>(), step_size_table.data_ptr<float>(), bias_correction2_sqrt_rcp_table.data_ptr<float>(),
-                n_elements, n_elements / n_gaussians, target_step,
-                static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(epsilon),
+                n_gaussians, n_elements / n_gaussians, target_step, 0.0f,
+                static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(epsilon), 0.0f,
                 static_cast<float>(std::log2(beta1 / std::sqrt(beta2))), static_cast<float>(std::log2(beta1)), static_cast<float>(std::log2(beta2)),
                 sr_seed(target_step, n_elements, 3));
         });
@@ -373,27 +476,13 @@ namespace faster_gs::adam {
         dispatch_moments(exp_avg, exp_avg_sq, [&](auto m1_tag, auto m2_tag) {
             using M1 = std::remove_pointer_t<decltype(m1_tag)>;
             using M2 = std::remove_pointer_t<decltype(m2_tag)>;
-            lazy_adam_step_cu<M1, M2><<<div_round_up(n_elements, config::block_size_adam_step), config::block_size_adam_step, 0, at::cuda::getCurrentCUDAStream()>>>(
-                param_grad.data_ptr<float>(),
-                param.data_ptr<float>(),
-                moment_ptr<M1>(exp_avg),
-                moment_ptr<M2>(exp_avg_sq),
-                visibility.data_ptr<uint8_t>(),
-                last_step.data_ptr<int>(),
-                f_table.data_ptr<float>(),
-                step_size_table.data_ptr<float>(),
-                bias_correction2_sqrt_rcp_table.data_ptr<float>(),
-                n_elements,
-                n_elements / n_gaussians,
-                step_count,
-                static_cast<float>(step_size),
-                static_cast<float>(beta1),
-                static_cast<float>(beta2),
-                static_cast<float>(epsilon),
-                static_cast<float>(bias_correction2_sqrt_rcp),
-                static_cast<float>(std::log2(beta1 / std::sqrt(beta2))),
-                static_cast<float>(std::log2(beta1)),
-                static_cast<float>(std::log2(beta2)),
+            launch_lazy_adam_warp<M1, M2, true>(
+                param_grad.data_ptr<float>(), param.data_ptr<float>(), moment_ptr<M1>(exp_avg), moment_ptr<M2>(exp_avg_sq),
+                visibility.data_ptr<uint8_t>(), last_step.data_ptr<int>(),
+                f_table.data_ptr<float>(), step_size_table.data_ptr<float>(), bias_correction2_sqrt_rcp_table.data_ptr<float>(),
+                n_gaussians, n_elements / n_gaussians, step_count, static_cast<float>(step_size),
+                static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(epsilon), static_cast<float>(bias_correction2_sqrt_rcp),
+                static_cast<float>(std::log2(beta1 / std::sqrt(beta2))), static_cast<float>(std::log2(beta1)), static_cast<float>(std::log2(beta2)),
                 sr_seed(step_count, n_elements, 1));
         });
         CHECK_CUDA(config::debug, "lazy_adam_step")
