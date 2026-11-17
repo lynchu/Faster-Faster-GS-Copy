@@ -150,10 +150,16 @@ class LazyAdam(FusedAdam):
             if param.numel() == 0:
                 continue
             state = self.state[param]
+            # Faster-GS+HalfMoments-SH: bfloat16 moments for the SH rest coefficients only
+            half = group.get('name') == 'sh_coefficients_rest'
             if len(state) == 0:
                 state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(param)
-                state['exp_avg_sq'] = torch.zeros_like(param)
+                state['exp_avg'] = torch.zeros_like(param, dtype=torch.bfloat16 if half else torch.float32)
+                state['exp_avg_sq'] = torch.zeros_like(param, dtype=torch.bfloat16 if half else torch.float32)
+            elif half and state['exp_avg'].dtype != torch.bfloat16:
+                # NeRFICG's extend_param_groups concatenates float32 zeros, which promotes the state to float32
+                state['exp_avg'] = state['exp_avg'].to(torch.bfloat16)
+                state['exp_avg_sq'] = state['exp_avg_sq'].to(torch.bfloat16)
             state['step'] += 1
             if state['step'] != self.step_count:
                 raise RuntimeError('LazyAdam: parameter groups are out of step')
