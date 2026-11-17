@@ -304,7 +304,9 @@ namespace faster_gs::rasterization::kernels::backward {
 
     // based on https://github.com/humansensinglab/taming-3dgs/blob/fd0f7d9edfe135eb4eefd3be82ee56dada7f2a16/submodules/diff-gaussian-rasterization/cuda_rasterizer/backward.cu#L404
     template <bool compute_abs_grad>
-    __global__ void blend_backward_cu(
+    // Faster-GS+LeanShuffle: at most 64 registers so that 16 blocks of 2 warps (32 warps, the register limit) fit per SM;
+    // without the bound the two-warp version uses 71-72 registers (28 warps)
+    __global__ void __launch_bounds__(32 * config::blend_backward_warps_per_block, 16) blend_backward_cu(
         const uint2* __restrict__ tile_instance_ranges,
         const uint* __restrict__ tile_bucket_offsets,
         const uint* __restrict__ instance_primitive_indices,
@@ -333,7 +335,8 @@ namespace faster_gs::rasterization::kernels::backward {
     {
         auto block = cg::this_thread_block();
         auto warp = cg::tiled_partition<32>(block);
-        const uint bucket_idx = block.group_index().x;
+        const uint warp_in_block = warp.meta_group_rank();
+        const uint bucket_idx = block.group_index().x * config::blend_backward_warps_per_block + warp_in_block;
         const uint lane_idx = warp.thread_rank();
 
         // launched with an upper bound of the bucket count
@@ -386,22 +389,30 @@ namespace faster_gs::rasterization::kernels::backward {
         const uint2 tile_coords = {tile_idx % grid_width, tile_idx / grid_width};
         const uint2 start_pixel_coords = {tile_coords.x * config::tile_width, tile_coords.y * config::tile_height};
 
-        uint last_contributor;
+        // Faster-GS+LeanShuffle: only the values that change along the splat chain (color after and transmittance) are
+        // passed between lanes with shuffles; the per-pixel constants (last contributor, color gradient, alpha gradient
+        // term) are read by every lane from a 64-entry ring buffer in shared memory (the pixels in flight span at most
+        // two chunks of 32). This cuts the LSU-pipe instructions per loop iteration from 12 to 7.
         float3 color_pixel_after;
         float transmittance;
-        float3 grad_color_pixel;
-        float grad_alpha_common;
 
         bucket_color_transmittance += bucket_idx * config::block_size_blend;
-        __shared__ uint collected_last_contributor[32];
-        __shared__ float4 collected_color_pixel_after_transmittance[32];
-        __shared__ float4 collected_grad_info_pixel[32];
+        __shared__ uint collected_last_contributor_all[config::blend_backward_warps_per_block][64];
+        __shared__ float4 collected_color_pixel_after_transmittance_all[config::blend_backward_warps_per_block][32];
+        __shared__ float4 collected_grad_info_pixel_all[config::blend_backward_warps_per_block][64];
+        // every warp works on its own bucket with its own buffers (no block-level synchronization)
+        uint* collected_last_contributor = collected_last_contributor_all[warp_in_block];
+        float4* collected_color_pixel_after_transmittance = collected_color_pixel_after_transmittance_all[warp_in_block];
+        float4* collected_grad_info_pixel = collected_grad_info_pixel_all[warp_in_block];
 
         // iterate over all pixels in the tile
         #pragma unroll
         for (int i = 0; i < config::block_size_blend + 31; ++i) {
             if (i % 32 == 0) {
                 const uint local_idx = i + lane_idx;
+                const uint ring_idx = local_idx & 63u;
+                // the slots of the chunk two steps back were last read in iteration i - 2
+                warp.sync();
                 if (local_idx < config::block_size_blend) {
                     const float4 color_transmittance = bucket_color_transmittance[local_idx];
                     const uint2 pixel_coords = {start_pixel_coords.x + local_idx % config::tile_width, start_pixel_coords.y + local_idx / config::tile_width};
@@ -425,25 +436,20 @@ namespace faster_gs::rasterization::kernels::backward {
                         color_pixel_w_bg - final_transmittance * background - make_float3(color_transmittance),
                         color_transmittance.w
                     );
-                    collected_grad_info_pixel[lane_idx] = make_float4(
+                    collected_grad_info_pixel[ring_idx] = make_float4(
                         grad_color_pixel,
                         final_transmittance * -dot(grad_color_pixel, background)
                     );
-                    collected_last_contributor[lane_idx] = tile_n_processed[pixel_idx];
+                    collected_last_contributor[ring_idx] = tile_n_processed[pixel_idx];
                 }
                 warp.sync();
             }
 
             if (i > 0) {
-                last_contributor = warp.shfl_up(last_contributor, 1);
                 color_pixel_after.x = warp.shfl_up(color_pixel_after.x, 1);
                 color_pixel_after.y = warp.shfl_up(color_pixel_after.y, 1);
                 color_pixel_after.z = warp.shfl_up(color_pixel_after.z, 1);
                 transmittance = warp.shfl_up(transmittance, 1);
-                grad_color_pixel.x = warp.shfl_up(grad_color_pixel.x, 1);
-                grad_color_pixel.y = warp.shfl_up(grad_color_pixel.y, 1);
-                grad_color_pixel.z = warp.shfl_up(grad_color_pixel.z, 1);
-                grad_alpha_common = warp.shfl_up(grad_alpha_common, 1);
             }
 
             // which pixel index should this thread deal with?
@@ -454,14 +460,17 @@ namespace faster_gs::rasterization::kernels::backward {
             // leader thread loads values from shared memory into registers
             if (valid_primitive && valid_pixel && lane_idx == 0 && idx < config::block_size_blend) {
                 const int current_shmem_index = i % 32;
-                last_contributor = collected_last_contributor[current_shmem_index];
                 const float4 color_pixel_after_transmittance = collected_color_pixel_after_transmittance[current_shmem_index];
                 color_pixel_after = make_float3(color_pixel_after_transmittance);
                 transmittance = color_pixel_after_transmittance.w;
-                const float4 grad_info_pixel = collected_grad_info_pixel[current_shmem_index];
-                grad_color_pixel = make_float3(grad_info_pixel);
-                grad_alpha_common = grad_info_pixel.w;
             }
+
+            // per-pixel constants of the pixel this lane works on (slots of out-of-range indices are never used)
+            const int ring_idx = idx & 63;
+            const uint last_contributor = collected_last_contributor[ring_idx];
+            const float4 grad_info_pixel = collected_grad_info_pixel[ring_idx];
+            const float3 grad_color_pixel = make_float3(grad_info_pixel);
+            const float grad_alpha_common = grad_info_pixel.w;
 
             const bool skip = !valid_primitive || !valid_pixel || idx < 0 || idx >= config::block_size_blend || tile_primitive_idx >= last_contributor;
             if (skip) continue;
