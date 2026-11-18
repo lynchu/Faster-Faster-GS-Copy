@@ -1,0 +1,48 @@
+From 3bf5ec1a686d0f68c74009525a222f25f500c542 Mon Sep 17 00:00:00 2001
+From: amos20918 <amos20918@gmail.com>
+Date: Tue, 17 Nov 2026 04:43:42 +0800
+Subject: [PATCH] bench: record wall-clock time of the training loop
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012LfdvJZ6n2cKuyDcVDc4Ko
+---
+ src/Methods/Base/Trainer.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/Methods/Base/Trainer.py b/src/Methods/Base/Trainer.py
+index 0396b6d..95d1426 100644
+--- a/src/Methods/Base/Trainer.py
++++ b/src/Methods/Base/Trainer.py
+@@ -12,6 +12,7 @@ from typing import IO, Callable, Generator
+ import datetime
+ import shutil
+ import inspect
++import time
+ 
+ import torch
+ import torch.multiprocessing as mp
+@@ -232,6 +233,10 @@ class BaseTrainer(Framework.Configurable, torch.nn.Module):
+                 with callback.timer:
+                     callback(self, starting_iteration, dataset)
+         # main training loop
++        # benchmark instrumentation: wall-clock time of the whole training loop (identical for all variants)
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        loop_start = time.perf_counter()
+         try:
+             training_callbacks = self._gather_callbacks(0)
+             for iteration in Logger.log_progress(range(starting_iteration, self.NUM_ITERATIONS), desc='training', miniters=10):
+@@ -247,6 +252,10 @@ class BaseTrainer(Framework.Configurable, torch.nn.Module):
+                 self.model.num_iterations_trained += 1
+         except KeyboardInterrupt:
+             Logger.log_warning('training manually interrupted')
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        with open(str(self.output_directory / 'loop_wall.txt'), 'w') as loop_file:
++            loop_file.write(f'LoopWall:{time.perf_counter() - loop_start}')
+         # log VRAM stats
+         self._log_vram_stats()
+         # run post-training callbacks
+-- 
+2.25.1
+
