@@ -1,0 +1,34 @@
+Faster-Faster-GS
+Copyright 2026 the Faster-Faster-GS authors
+
+This project is a modified version of Faster-GS (https://github.com/nerficg-project/faster-gaussian-splatting),
+licensed under the Apache License, Version 2.0 (see LICENSE). The upstream history is kept in this repository;
+upstream commit 4f8e186 is the starting point of the changes.
+
+Files modified by this project:
+  FasterGSCudaBackend/__init__.py
+  FasterGSCudaBackend/FasterGSCudaBackend/rasterization/include/backward.h
+  FasterGSCudaBackend/FasterGSCudaBackend/rasterization/include/kernels_backward.cuh
+  FasterGSCudaBackend/FasterGSCudaBackend/rasterization/include/kernels_forward.cuh
+  FasterGSCudaBackend/FasterGSCudaBackend/rasterization/include/rasterization_api.h
+  FasterGSCudaBackend/FasterGSCudaBackend/rasterization/include/rasterization_config.h
+  FasterGSCudaBackend/FasterGSCudaBackend/rasterization/src/backward.cu
+  FasterGSCudaBackend/FasterGSCudaBackend/rasterization/src/rasterization_api.cu
+  FasterGSCudaBackend/FasterGSCudaBackend/torch_bindings/adam.py
+  FasterGSCudaBackend/FasterGSCudaBackend/torch_bindings/bindings.cpp
+  FasterGSCudaBackend/FasterGSCudaBackend/torch_bindings/rasterization.py
+  Loss.py
+  Model.py
+  README.md
+  Renderer.py
+  Trainer.py
+
+Files added by this project:
+  FasterGSCudaBackend/FasterGSCudaBackend/adam/include/lazy_adam.h
+  FasterGSCudaBackend/FasterGSCudaBackend/adam/include/lazy_adam_device.cuh
+  FasterGSCudaBackend/FasterGSCudaBackend/adam/src/lazy_adam.cu
+  FasterGSCudaBackend/FasterGSCudaBackend/loss/include/fused_loss.h
+  FasterGSCudaBackend/FasterGSCudaBackend/loss/src/fused_loss.cu
+  FasterGSCudaBackend/FasterGSCudaBackend/torch_bindings/fused_loss.py
+  NOTICE
+  bench/ (benchmark harness, tests, and a NeRFICG patch; the patch modifies NeRFICG, which is MIT-licensed)

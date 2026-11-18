@@ -1,3 +1,72 @@
+# Faster-Faster-GS
+
+這是平行程式設計課程的期末專題：在不降低影像品質的前提下，讓 [Faster-GS](https://github.com/nerficg-project/faster-gaussian-splatting) 的訓練再更快。
+目前的版本在程式和量測紀錄裡叫做 **Faster-GS+Combo-Full**，它在 Faster-GS 之上結合了十項優化。
+
+## 結果
+
+Mip-NeRF360 全部 9 個場景，NVIDIA RTX PRO 6000 Blackwell，每個方法 3 個 seed。品質指標取 seed 平均，訓練時間和 VRAM 取每個場景的 seed 中位數，表中數值都是 9 個場景的平均。加速倍數和相同 seed 的 Faster-GS 配對計算。
+
+| 方法 | PSNR↑ | SSIM↑ | LPIPS↓ | 訓練時間↓ | VRAM↓ | #Gs | 加速 |
+|---|---|---|---|---|---|---|---|
+| Faster-GS | 27.535 | 0.8144 | 0.2544 | 231.6 s | 5.96 GiB | 2.70M | 1.00× |
+| Faster-GS+Combo-Full | 27.531 | 0.8146 | 0.2543 | 106.8 s | 5.76 GiB | 2.70M | 2.17× |
+
+## 十項優化
+
+| 名稱 | 做了什麼 |
+|---|---|
+| SyncFree | 拿掉每次迭代裡 loss 記錄和相機上傳造成的 CPU–GPU 同步，CPU 可以一直往前排 kernel。 |
+| FusedLoss | L1 和 D-SSIM 合成一個 autograd 節點，loss 的前向和反向從 24 個 kernel 變成 6 個。 |
+| LeanLoop | 拿掉訓練迴圈裡每次迭代的 Python 額外開銷，例如模式切換、學習率查詢和 optimizer step 的包裝層。 |
+| WarpSync | blend forward 在 block barrier 之前先讓 warp 重新會合，barrier 不再占用整個 SM 的所有 barrier 單元，每個 SM 可以同時放 8 個 block，原本只能放 1 個。 |
+| LazyAdam-Exact | Adam 只更新目前視角看得到的高斯。被跳過的步數在高斯再次被渲染之前用封閉解補上，所以參數和一般 Adam 完全一致。 |
+| HalfMoments-SR | Adam 的 m 和 v 用 bfloat16 儲存；v 使用隨機捨入，衰減才不會出現偏差。 |
+| LeanShuffle | blend backward 只用 warp shuffle 傳遞 lane 之間會改變的 4 個像素值，另外 5 個常數改從 shared memory 的環狀緩衝區讀取。 |
+| BwdHoist | 把每個高斯固定不變的係數移出 blend backward 的像素迴圈，迴圈結束後只乘一次。建立在 LeanShuffle 之上。 |
+| WarpLazy | lazy Adam 和補更新的 kernel 改成一個 warp 處理 32 個高斯，32 個都看不到時整個 warp 直接跳過。建立在 LazyAdam-Exact 之上。 |
+| FusedShAdam | SH 高階係數的 lazy Adam 更新直接在 preprocess backward 裡完成，它們的梯度不必寫回 global memory。建立在 LazyAdam-Exact 和 WarpLazy 之上。 |
+
+LazyAdam-Exact 假設看不到的高斯除了 Adam 本身以外不會收到任何更新，所以開啟 MCMC、3D filter、PPISP，或 opacity / scale 正則化時，訓練會直接報錯。
+
+## Repository 結構
+
+- 方法程式碼維持上游的結構，安裝到 NeRFICG 的 `src/Methods/FasterGS`，安裝方式見下方原本的說明。
+- `bench/` 是量測與 profiling 工具：
+  - `variants.py`：為每個版本建立獨立的 NeRFICG clone 和 Faster-GS worktree，並編譯它的 CUDA backend；
+  - `run_bench.py`、`run_suite.py`：跑完整訓練，多個版本交錯執行，每次結果記錄到 registry；支援 Mip-NeRF360、Tanks and Temples、Deep Blending；
+  - `summarize.py`：把 registry 整理成結果表；
+  - `eval_images.py`：用和 NeRFICG 相同的算法計算測試影像的 PSNR、SSIM、LPIPS，用來評估外部方法；
+  - `prof/`：nsys 和 ncu 的輔助腳本；
+  - `tests/`：各項優化的等價性與精度測試；
+  - `patches/`：NeRFICG 的一個小修改，記錄訓練迴圈的實際時間。
+
+## 重現量測
+
+1. 依照下方原本的說明安裝 NeRFICG 和這個方法，然後套用計時修改：
+   `git -C <nerficg> am <本 repo>/bench/patches/0001-bench-record-wall-clock-time-of-the-training-loop.patch`
+2. 準備一個工作目錄，裡面放 `nerficg/`、`faster-gaussian-splatting/`（也就是本 repo）、`dataset/` 和一個空的 `variants/`，並把 `FFGS_ROOT` 指到這個目錄。其他可設定的環境變數：
+   - `FFGS_CONDA_ENV`：Python 環境；
+   - `FFGS_GPU`：nvidia-smi 的 GPU 編號；
+   - `CUDA_HOME`；
+   - `FGS_ARCH`：要編譯的 CUDA 架構，預設 `12.0`；
+   - `FFGS_CC`、`FFGS_CXX`：主機端編譯器。
+3. 建立、編譯並量測一個版本：
+   ```shell
+   python bench/variants.py create combofull --base main
+   python bench/variants.py build combofull
+   python bench/run_suite.py baseline,combofull --scenes all --seeds 0,1,2
+   python bench/summarize.py --no-dashboard
+   ```
+
+## 授權
+
+和上游 Faster-GS 一樣採用 Apache-2.0。本專題修改和新增的檔案列在 [NOTICE](./NOTICE)。
+
+---
+
+# 原本的 Faster-GS README
+
 # Faster Gaussian Splatting
 ![PyTorch](https://img.shields.io/badge/-PyTorch-EE4C2C?logo=PyTorch&logoColor=white)&nbsp;
 ![CUDA](https://img.shields.io/badge/-CUDA-76B900?logo=NVIDIA&logoColor=white)&nbsp;
